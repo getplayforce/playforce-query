@@ -26,7 +26,7 @@ pre { background:#f8f8f8; padding:15px; border-radius:4px; overflow:auto; font-f
 pre:focus { outline:none; }
 .error { background:#f8d7da; color:#721c24; padding:15px; border-radius:4px; border:1px solid #f5c6cb; }
 .search-box { position:absolute; top:10px; right:10px; background:#fff; border:2px solid #0066cc; border-radius:4px; padding:8px; box-shadow:0 2px 8px rgba(0,0,0,0.2); z-index:1000; display:none; }
-.search-box input { border:1px solid #ccc; padding:4px; margin-right:4px; font-size:12px; }
+.search-box input { border:1px solid #ccc; padding:4px; margin-right:4px; font-size:12px; width:250px; }
 .search-box button { background:#0066cc; color:white; border:none; padding:4px 8px; cursor:pointer; font-size:12px; }
 .search-box button:hover { background:#0052a3; }
 .search-highlight { background:#ffff00; color:#000; }
@@ -52,8 +52,10 @@ pre:focus { outline:none; }
                 <input type="checkbox" id="convertUtcCheckbox" onchange="toggleUtcConversion()" style="cursor:pointer;">
                 <span>Local Time</span>
             </label>
-            <button id="copyBtn" class="action-btn" style="display:none;">📋 Copy</button>
-            <button id="exportBtn" class="action-btn" style="display:none;">📄 Export JSON</button>
+            <span id="buttonGroup" style="display:none;">
+                <button id="copyBtn" class="action-btn">Copy JSON</button>
+                <button id="exportBtn" class="action-btn">Export JSON</button>
+            </span>
             <button id="openInSF" class="action-btn sf-link" style="display:none;">Open in Salesforce</button>
         </div>
     </div>
@@ -199,7 +201,7 @@ function renderResult(resultData, isToggle = false) {
         try {
             await navigator.clipboard.writeText(jsonText);
             const originalText = copyBtn.textContent;
-            copyBtn.textContent = '✓ Copied!';
+            copyBtn.textContent = '✓';
             setTimeout(() => {
                 copyBtn.textContent = originalText;
             }, 2000);
@@ -441,6 +443,7 @@ document.addEventListener('keydown', (e) => {
 ipcRenderer.invoke('get-result-data').then(resultWrapper => {
     const contentDiv = document.getElementById('content');
     const openInSFBtn = document.getElementById('openInSF');
+    const buttonGroup = document.getElementById('buttonGroup');
     const copyBtn = document.getElementById('copyBtn');
     const exportBtn = document.getElementById('exportBtn');
     const checkbox = document.getElementById('convertUtcCheckbox');
@@ -473,8 +476,7 @@ ipcRenderer.invoke('get-result-data').then(resultWrapper => {
         renderResult(resultData);
         
         // Show buttons
-        copyBtn.style.display = 'block';
-        exportBtn.style.display = 'block';
+        buttonGroup.style.display = 'inline';
         
         // Update title with object type if available
         if (resultData.attributes && resultData.attributes.type) {

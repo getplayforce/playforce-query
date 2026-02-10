@@ -176,6 +176,7 @@ async function authenticate() {
 
         console.log("Authentication successful");
         saveToken(data);
+        
         return data;
     } catch (error) {
         console.error("Authentication error:", error);
@@ -283,6 +284,130 @@ function extractObjectName(query) {
     return fromMatch ? fromMatch[1] : null;
 }
 
+// Cache for Tooling API objects per environment (dynamically fetched from Salesforce)
+let toolingObjectsCache = {}; // Store per config file: { configFileName: objectNames[] }
+let dataObjectsCache = {}; // Store per config file: { configFileName: objectNames[] }
+
+// Fetch list of Tooling API objects from Salesforce
+async function fetchToolingObjects() {
+    try {
+        const config = loadConfig();
+        if (!config || !currentConfigFile) {
+            console.warn('No config selected, cannot fetch Tooling API objects');
+            return null;
+        }
+        
+        const apiVersion = config.apiVersion;
+        const { token, instanceUrl } = await getAccessToken();
+        
+        const url = `${instanceUrl}/services/data/${apiVersion}/tooling/sobjects/`;
+        console.log('Fetching Tooling API objects from:', url);
+        
+        const res = await fetch(url, {
+            headers: {
+                "Authorization": `Bearer ${token}`,
+                "Content-Type": "application/json"
+            }
+        });
+        
+        if (!res.ok) {
+            const text = await res.text();
+            console.error('Failed to fetch Tooling API objects:', text);
+            return null;
+        }
+        
+        const result = await res.json();
+        const toolingSObjects = result.sobjects || [];
+        console.log(`Fetched ${toolingSObjects.length} Tooling API objects for ${path.basename(currentConfigFile)}`);
+        
+        // Cache per environment
+        toolingObjectsCache[currentConfigFile] = toolingSObjects;
+        return toolingSObjects;
+    } catch (error) {
+        console.error('Error fetching Tooling API objects:', error);
+        return null;
+    }
+}
+
+// Extract object name from a SOQL query, REST path, or plain object name
+function extractObjectNameFromInput(input) {
+    if (!input) return null;
+    
+    // Try to extract from FROM clause (SOQL query)
+    const fromMatch = input.match(/\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+    if (fromMatch) {
+        return fromMatch[1];
+    }
+    
+    // Try first path segment (REST path like "Account/001..." or plain "Account")
+    const pathMatch = input.match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
+    if (pathMatch) {
+        return pathMatch[1];
+    }
+    
+    return null;
+}
+
+// Check if an object name is a Tooling API object
+function isToolingObject(objectName) {
+    if (!objectName || !currentConfigFile) {
+        return false;
+    }
+    
+    // Get cached lists for current environment
+    const toolingObjectsList = toolingObjectsCache[currentConfigFile];
+    const dataObjectsList = dataObjectsCache[currentConfigFile];
+    
+    // If not cached, trigger fetch in background and return false for now
+    if (!toolingObjectsList || !Array.isArray(toolingObjectsList) || toolingObjectsList.length === 0) {
+        console.log('Tooling API objects not yet cached, fetching in background...');
+        fetchToolingObjects().catch(err => 
+            console.error('Background fetch of Tooling API objects failed:', err)
+        );
+        return false;
+    }
+    
+    if (!dataObjectsList || !Array.isArray(dataObjectsList) || dataObjectsList.length === 0) {
+        console.log('Data API objects not yet cached, fetching in background...');
+        describeGlobal().then(result => {
+            dataObjectsCache[currentConfigFile] = result.sobjects || [];
+        }).catch(err => 
+            console.error('Background fetch of Data API objects failed:', err)
+        );
+        return false;
+    }
+    
+    // Check if object exists in Tooling API
+    const inTooling = toolingObjectsList.some(obj => 
+        obj && obj.name && obj.name.toLowerCase() === objectName.toLowerCase()
+    );
+    
+    if (!inTooling) {
+        return false;
+    }
+    
+    // Check if object also exists in Data API
+    const inData = dataObjectsList.some(obj => 
+        obj && obj.name && obj.name.toLowerCase() === objectName.toLowerCase()
+    );
+    
+    // If object exists in both APIs, prefer Data API (has more complete fields)
+    if (inData) {
+        console.log(`${objectName} exists in both APIs - using Data API for complete fields`);
+        return false;
+    }
+    
+    // Object only exists in Tooling API
+    console.log(`${objectName} only in Tooling API - using Tooling API`);
+    return true;
+}
+
+// Detect if a query or path should use Tooling API
+function shouldUseToolingAPI(queryOrPath) {
+    const objectName = extractObjectNameFromInput(queryOrPath);
+    return isToolingObject(objectName);
+}
+
 // Expand SELECT * to actual field names
 async function expandSelectStar(query) {
     // Check if query contains SELECT *
@@ -328,6 +453,17 @@ async function expandSelectStar(query) {
 async function executeSOQL(query, onProgress = null, abortSignal = null) {
     console.log('executeSOQL called with:', query);
     
+    // Detect if this query uses Tooling API objects
+    const useTooling = shouldUseToolingAPI(query);
+    
+    // Check license for Tooling API
+    if (useTooling) {
+        const licenseStatus = checkLicense();
+        if (!licenseStatus.licensed) {
+            throw new Error(`License required for Tooling API access. ${licenseStatus.message} Visit https://getplayforce.com to get a license and paste it into your .env file.`);
+        }
+    }
+    
     // Expand SELECT * if present
     query = await expandSelectStar(query);
     
@@ -339,8 +475,10 @@ async function executeSOQL(query, onProgress = null, abortSignal = null) {
             ({ token, instanceUrl } = await getAccessToken());
         }
 
-        const url = `${instanceUrl}/services/data/${apiVersion}/query/?q=${encodeURIComponent(query)}`;
-        console.log('Making SOQL request to:', url);
+        // Use /services/data/v##.0/tooling/query or /services/data/v##.0/query
+        const toolingPath = useTooling ? '/tooling' : '';
+        const url = `${instanceUrl}/services/data/${apiVersion}${toolingPath}/query/?q=${encodeURIComponent(query)}`;
+        console.log(`Making ${useTooling ? 'Tooling API' : 'Data API'} SOQL request to:`, url);
 
         const fetchOptions = {
             headers: {
@@ -361,6 +499,9 @@ async function executeSOQL(query, onProgress = null, abortSignal = null) {
 
         const result = await res.json();
         console.log('SOQL success, returned', result.totalSize, 'records');
+        
+        // Add metadata about which API was used
+        result._apiType = useTooling ? 'tooling' : 'data';
         
         // If there are more records, fetch them automatically
         if (result.nextRecordsUrl) {
@@ -426,7 +567,8 @@ async function executeSOQL(query, onProgress = null, abortSignal = null) {
             return {
                 ...result,
                 records: allRecords,
-                done: true
+                done: true,
+                _apiType: useTooling ? 'tooling' : 'data'
             };
         }
         
@@ -550,11 +692,15 @@ async function executeREST(path, method = 'GET', body = null, headers = null) {
     const config = loadConfig();
     const apiVersion = config.apiVersion;
     
-    // Check license for write operations - now enforced
-    if (method !== 'GET') {
+    // Detect if this path uses Tooling API objects
+    const useTooling = shouldUseToolingAPI(path);
+    
+    // Check license for write operations or Tooling API
+    if (method !== 'GET' || useTooling) {
         const licenseStatus = checkLicense();
         if (!licenseStatus.licensed) {
-            throw new Error(`License required for write operations. ${licenseStatus.message} Visit https://getplayforce.com to get a license and paste it into your .env file.`);
+            const reason = useTooling ? 'Tooling API access' : 'write operations';
+            throw new Error(`License required for ${reason}. ${licenseStatus.message} Visit https://getplayforce.com to get a license and paste it into your .env file.`);
         }
     }
 
@@ -563,8 +709,10 @@ async function executeREST(path, method = 'GET', body = null, headers = null) {
             ({ token, instanceUrl } = await getAccessToken());
         }
 
-        const url = `${instanceUrl}/services/data/${apiVersion}/sobjects/${path}`;
-        console.log(`Making ${method} REST request to:`, url);
+        // Use /services/data/v##.0/tooling/sobjects or /services/data/v##.0/sobjects
+        const toolingPath = useTooling ? '/tooling' : '';
+        const url = `${instanceUrl}/services/data/${apiVersion}${toolingPath}/sobjects/${path}`;
+        console.log(`Making ${method} ${useTooling ? 'Tooling API' : 'Data API'} REST request to:`, url);
         if (headers) {
             console.log('Custom headers:', JSON.stringify(headers));
         }
@@ -594,12 +742,17 @@ async function executeREST(path, method = 'GET', body = null, headers = null) {
 
         // For DELETE or some operations, response might be empty
         const contentType = res.headers.get('content-type');
+        let resultData;
         if (contentType && contentType.includes('application/json')) {
-            return await res.json();
+            resultData = await res.json();
         } else {
             // For 204 No Content or other non-JSON responses
-            return { success: true, status: res.status };
+            resultData = { success: true, status: res.status };
         }
+        
+        // Add metadata about which API was used
+        resultData._apiType = useTooling ? 'tooling' : 'data';
+        return resultData;
     });
 }
 
@@ -684,6 +837,12 @@ async function describeGlobal() {
 
         const result = await res.json();
         console.log('describeGlobal success, returned', result.sobjects?.length || 0, 'objects');
+        
+        // Cache the Data API objects for this environment
+        if (currentConfigFile && result.sobjects) {
+            dataObjectsCache[currentConfigFile] = result.sobjects;
+        }
+        
         return result;
     });
 }
@@ -696,14 +855,18 @@ async function describeObject(objectName) {
         throw new Error('No config selected. Please select an environment first.');
     }
     const apiVersion = config.apiVersion;
+    
+    // Detect if this object uses Tooling API
+    const useTooling = shouldUseToolingAPI(objectName);
 
     return await withTokenRetry(async (token, instanceUrl) => {
         if (!token || !instanceUrl) {
             ({ token, instanceUrl } = await getAccessToken());
         }
 
-        const url = `${instanceUrl}/services/data/${apiVersion}/sobjects/${objectName}/describe`;
-        console.log('Making describeObject request to:', url);
+        const toolingPath = useTooling ? '/tooling' : '';
+        const url = `${instanceUrl}/services/data/${apiVersion}${toolingPath}/sobjects/${objectName}/describe`;
+        console.log(`Making ${useTooling ? 'Tooling API' : 'Data API'} describeObject request to:`, url);
 
         const res = await fetch(url, {
             headers: {
@@ -741,7 +904,8 @@ module.exports = {
     hasValidToken,
     describeGlobal,
     describeObject,
-    getLicenseInfo
+    getLicenseInfo,
+    fetchToolingObjects
 };
 
 console.log('salesforce.js loaded successfully');

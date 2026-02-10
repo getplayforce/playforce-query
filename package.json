@@ -1,7 +1,11 @@
 {
   "name": "Playforce Query",
-  "version": "1.0.0",
+  "version": "0.3.0",
   "main": "main.js",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=9.0.0"
+  },
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder"
@@ -13,6 +17,7 @@
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.0",
     "@codemirror/commands": "^6.10.1",
+    "@codemirror/lang-json": "^6.0.2",
     "@codemirror/lang-sql": "^6.10.0",
     "@codemirror/search": "^6.5.11",
     "@codemirror/state": "^6.5.3",

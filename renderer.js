@@ -2,9 +2,10 @@
 const { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightActiveLine, Decoration, ViewPlugin } = require('@codemirror/view');
 const { EditorState, StateField, StateEffect, RangeSetBuilder } = require('@codemirror/state');
 const { sql } = require('@codemirror/lang-sql');
+const { json } = require('@codemirror/lang-json');
 const { defaultKeymap, history, historyKeymap } = require('@codemirror/commands');
 const { searchKeymap, highlightSelectionMatches } = require('@codemirror/search');
-const { syntaxHighlighting, HighlightStyle } = require('@codemirror/language');
+const { syntaxHighlighting, HighlightStyle, LanguageSupport, StreamLanguage } = require('@codemirror/language');
 const { tags } = require('@lezer/highlight');
 const { autocompletion, acceptCompletion, startCompletion } = require('@codemirror/autocomplete');
 
@@ -52,6 +53,44 @@ const slashCommentPlugin = ViewPlugin.fromClass(class {
   decorations: v => v.decorations
 });
 
+// Custom decorator for REST API syntax - highlights JSON-like portions
+const restObjectDecoration = Decoration.mark({ class: "cm-rest-object" });
+
+const restSyntaxPlugin = ViewPlugin.fromClass(class {
+  constructor(view) {
+    this.decorations = this.buildDecorations(view);
+  }
+  
+  update(update) {
+    if (update.docChanged || update.viewportChanged) {
+      this.decorations = this.buildDecorations(update.view);
+    }
+  }
+  
+  buildDecorations(view) {
+    const builder = new RangeSetBuilder();
+    const doc = view.state.doc;
+    
+    for (let i = 1; i <= doc.lines; i++) {
+      const line = doc.line(i);
+      const lineText = line.text;
+      
+      // Check if this is a REST API line (object name followed by opening brace, with optional ID)
+      const restMatch = lineText.match(/^\s*(\w+)(?:\/[a-zA-Z0-9]+)?\s*\{/);
+      if (!restMatch) continue;
+      
+      // Highlight just the object name with custom style
+      const objectStart = lineText.indexOf(restMatch[1]);
+      const objectEnd = objectStart + restMatch[1].length;
+      builder.add(line.from + objectStart, line.from + objectEnd, restObjectDecoration);
+    }
+    
+    return builder.finish();
+  }
+}, {
+  decorations: v => v.decorations
+});
+
 window.createCodeMirrorEditor = function(parent) {
   // SOQL autocomplete function
   const soqlAutocompletion = async (context) => {
@@ -71,10 +110,11 @@ window.createCodeMirrorEditor = function(parent) {
         suggestions = sobjects.map(obj => {
           const objName = typeof obj === 'string' ? obj : obj.name;
           const objLabel = typeof obj === 'object' ? obj.label : '';
+          const isTooling = obj.isTooling === true;
           return {
             label: objName,
             type: "class",
-            detail: objLabel
+            detail: isTooling ? `🔧 ${objLabel}` : objLabel
           };
         });
       } else if (acContext.type === 'field') {
@@ -212,6 +252,30 @@ window.createCodeMirrorEditor = function(parent) {
       // Calculate the position to replace (from start of prefix to cursor)
       const from = cursorPos - acContext.prefix.length;
       
+      // For REST API syntax, wrap field names in quotes and add colon for value entry
+      if (acContext.isRest) {
+        // Check if there's already an opening quote before the insertion point
+        const charBeforeFrom = from > 0 ? text[from - 1] : '';
+        const hasQuoteBefore = charBeforeFrom === '"' || charBeforeFrom === "'";
+        
+        filtered.forEach(item => {
+          // For relationship fields, add opening brace for nested object
+          if (item.type === "namespace") {
+            const insertText = hasQuoteBefore ? `${item.label}": { ` : `"${item.label}": { `;
+            item.apply = (view, completion, from, to) => {
+              view.dispatch({
+                changes: {from, to, insert: insertText},
+                selection: {anchor: from + insertText.length}
+              });
+              // Trigger autocomplete after inserting the opening brace
+              startCompletion(view);
+            };
+          } else {
+            item.apply = hasQuoteBefore ? `${item.label}": ` : `"${item.label}": `;
+          }
+        });
+      }
+      
       return {
         from: from,
         options: filtered
@@ -239,7 +303,9 @@ window.createCodeMirrorEditor = function(parent) {
       //highlightActiveLine(),
       //highlightSelectionMatches(),
       sql(),
+      json(),
       slashCommentPlugin,
+      restSyntaxPlugin,
       autocompletion({ 
         override: [soqlAutocompletion],
         activateOnTyping: true,
@@ -329,6 +395,10 @@ window.createCodeMirrorEditor = function(parent) {
         },
         ".cm-comment": {
           color: "#9ccc9c"
+        },
+        ".cm-rest-object": {
+          color: "#d73a49",
+          fontWeight: "bold"
         },
         ".cm-tooltip.cm-tooltip-autocomplete": {
           minHeight: "50px",

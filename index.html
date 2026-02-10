@@ -25,6 +25,7 @@ try {
         onSOQLProgress: (callback) => ipcRenderer.on('soql-progress', (event, progress) => callback(progress)),
         describeGlobal: () => ipcRenderer.invoke('describe-global'),
         describeObject: (objectName) => ipcRenderer.invoke('describe-object', objectName),
+        fetchToolingObjects: () => ipcRenderer.invoke('fetch-tooling-objects'),
         getLicenseInfo: () => ipcRenderer.invoke('get-license-info'),
         openExternal: (url) => ipcRenderer.invoke('open-external', url),
         openResultWindow: (data) => ipcRenderer.invoke('open-result-window', data),
@@ -78,7 +79,7 @@ tr:hover { background:#fffae6; }
 .keyword { color:#d73a49; font-weight:bold; }
 
 #results-header { display:flex; justify-content:flex-end; align-items:center; gap:8px; padding:4px 8px; border-bottom:1px solid #ccc; background:#f5f5f5; }
-#copyResultsBtn { padding:4px 8px; font-size:12px; cursor:pointer; }
+#copyTableBtn, #copyJsonBtn { padding:4px 8px; font-size:12px; cursor:pointer; }
 #stopQueryBtn { padding:4px 8px; font-size:12px; cursor:pointer; background:#dc3545; color:white; border:none; border-radius:4px; display:none; }
 #stopQueryBtn:hover { background:#c82333; }
 #exportJsonBtn, #exportCsvBtn { padding:4px 8px; font-size:12px; cursor:pointer; }
@@ -86,7 +87,7 @@ tr:hover { background:#fffae6; }
 #clearFiltersBtn:hover { background:#5a6268; }
 
 .search-box { position:absolute; top:10px; right:10px; background:#fff; border:2px solid #0066cc; border-radius:4px; padding:8px; box-shadow:0 2px 8px rgba(0,0,0,0.2); z-index:1000; display:none; }
-.search-box input { border:1px solid #ccc; padding:4px; margin-right:4px; font-size:12px; }
+.search-box input { border:1px solid #ccc; padding:4px; margin-right:4px; font-size:12px; width:250px; }
 .search-box button { background:#0066cc; color:white; border:none; padding:4px 8px; cursor:pointer; font-size:12px; }
 .search-box button:hover { background:#0052a3; }
 .search-highlight { background:#ffff00; color:#000; }
@@ -113,8 +114,8 @@ tr:hover { background:#fffae6; }
 </head>
 <body>
 <div id="toolbar">
-    <button onclick="saveSession()">💾 Save Session</button>
-    <button onclick="document.getElementById('fileInput').click()">📂 Load Session</button>
+    <button onclick="saveSession()">Save Session</button>
+    <button onclick="document.getElementById('fileInput').click()">Load Session</button>
     <input type="file" id="fileInput" accept=".txt,.soql" onchange="loadSession(event)">
     
     <select id="envSelector" onchange="changeEnvironment()" style="margin-left:20px; padding:6px 12px; border-radius:4px; border:1px solid #ccc;">
@@ -134,7 +135,7 @@ tr:hover { background:#fffae6; }
 
 <div id="helpModal" onclick="if(event.target===this) toggleHelp()">
     <div id="helpContent">
-        <h3>⌨️ Keyboard Shortcuts & Help </h3>
+        <h3>Keyboard Shortcuts & Help</h3>
 
         <table>
             <tr><td>Ctrl+E or F5</td><td>Execute query block</td></tr>
@@ -155,7 +156,6 @@ tr:hover { background:#fffae6; }
             <code style="background:#e9ecef; padding:3px 5px; border-radius:3px;">Account {"header": "val"} {"Name": "New"}</code> → POST with headers<br>
             <code style="background:#e9ecef; padding:3px 5px; border-radius:3px;">DELETE Account/001xx</code> → DELETE 
         </div>
-
         <div id="licenseInfo" style="margin-bottom:15px; padding:10px; background:#e8f5e9; border-left:4px solid #4caf50; border-radius:4px; font-size:12px; display:none;">
             <div style="font-weight:bold; color:#2e7d32; margin-bottom:4px;">✓ Licensed</div>
             <div style="color:#555;" id="licenseDetails"></div>
@@ -170,7 +170,7 @@ tr:hover { background:#fffae6; }
 
 <div id="releaseNotesModal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:10000; display:none; align-items:center; justify-content:center;" onclick="if(event.target===this) toggleReleaseNotes()">
     <div style="background:#fff; border-radius:8px; padding:20px; max-width:600px; max-height:80vh; overflow-y:auto; box-shadow:0 4px 16px rgba(0,0,0,0.3);">
-        <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #0066cc; padding-bottom:8px;">📝 Release Notes</h3>
+        <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #0066cc; padding-bottom:8px;">Release Notes</h3>
         <div id="releaseNotesContent" style="font-family:sans-serif; font-size:13px; line-height:1.6; color:#333;">
             <p>Loading...</p>
         </div>
@@ -189,10 +189,13 @@ tr:hover { background:#fffae6; }
             <input type="checkbox" id="convertUtcCheckbox" onchange="toggleUtcConversion()" style="cursor:pointer;">
             <span>Local Time</span>
         </label>
-        <button id="copyResultsBtn" tabindex="-1">📋 Copy</button>
         <button id="stopQueryBtn" onclick="stopQuery()">⏹ Stop Query</button>
-        <button id="exportJsonBtn" onclick="exportToJSON()" tabindex="-1" style="display:none;">📄 Export JSON</button>
-        <button id="exportCsvBtn" onclick="exportToCSV()" tabindex="-1" style="display:none;">📊 Export CSV</button>
+        <span id="buttonGroup" style="display:none;">
+            <button id="copyJsonBtn" tabindex="-1">Copy JSON</button>
+            <button id="copyTableBtn" tabindex="-1">Copy Table</button>
+            <button id="exportJsonBtn" onclick="exportToJSON()" tabindex="-1">Export JSON</button>
+            <button id="exportCsvBtn" onclick="exportToCSV()" tabindex="-1">Export CSV</button>
+        </span>
     </div>
     <div id="log" tabindex="0">
         <div id="logContent">👉 Select an environment first, then press Ctrl+E or F5 on a block above to execute.</div>
@@ -1057,18 +1060,35 @@ function formatErrorMessage(errorMessage) {
 }
 
 // Copy button
-document.getElementById('copyResultsBtn').addEventListener('click',()=>{ 
+// Copy Table button
+document.getElementById('copyTableBtn').addEventListener('click',()=>{ 
     if(!log.innerText) return; 
-    const btn = document.getElementById('copyResultsBtn');
+    const btn = document.getElementById('copyTableBtn');
     navigator.clipboard.writeText(log.innerText)
         .then(() => {
             const originalText = btn.textContent;
-            btn.textContent = '✓ Copied!';
+            btn.textContent = '✓';
             setTimeout(() => {
                 btn.textContent = originalText;
             }, 2000);
         })
         .catch(err=>alert('❌ Failed to copy results')); 
+});
+
+// Copy JSON button
+document.getElementById('copyJsonBtn').addEventListener('click',()=>{ 
+    if(!currentResultData) return; 
+    const btn = document.getElementById('copyJsonBtn');
+    const jsonStr = JSON.stringify(currentResultData, null, 2);
+    navigator.clipboard.writeText(jsonStr)
+        .then(() => {
+            const originalText = btn.textContent;
+            btn.textContent = '✓';
+            setTimeout(() => {
+                btn.textContent = originalText;
+            }, 2000);
+        })
+        .catch(err=>alert('❌ Failed to copy JSON')); 
 });
 
 // Ctrl+A in log - select all results content
@@ -1601,8 +1621,7 @@ document.addEventListener("keydown",async e=>{
         if (!envSelector.value) {
             logContent.innerHTML = '';
             currentResultData = null;
-            document.getElementById('exportJsonBtn').style.display = 'none';
-            document.getElementById('exportCsvBtn').style.display = 'none';
+            document.getElementById('buttonGroup').style.display = 'none';
             showEnvironmentReminder();
             return;
         }
@@ -1661,8 +1680,7 @@ document.addEventListener("keydown",async e=>{
         currentTbody = null;
         currentResultData = null;
         filtersVisible = false; // Reset filter visibility
-        document.getElementById('exportJsonBtn').style.display = 'none';
-        document.getElementById('exportCsvBtn').style.display = 'none';
+        document.getElementById('buttonGroup').style.display = 'none';
         currentQueryId = 'query_' + Date.now();
         queryStartTime = Date.now();
         document.getElementById('resultsCount').textContent = '';
@@ -1711,7 +1729,8 @@ document.addEventListener("keydown",async e=>{
                         });
                         
                         currentResultData = { records: partialRecords, totalSize: partialRecords.length };
-                        document.getElementById('exportJsonBtn').style.display = 'inline-block';
+                        document.getElementById('buttonGroup').style.display = 'inline';
+                        document.getElementById('copyTableBtn').style.display = 'inline-block';
                         document.getElementById('exportCsvBtn').style.display = 'inline-block';
                         
                         const elapsedMs = queryStartTime ? Date.now() - queryStartTime : 0;
@@ -1867,26 +1886,36 @@ function renderResult(result, isRerender = false) {
         originalElapsedTime = elapsedSec;
     }
     
+    // Check if this was a Tooling API call
+    const apiIndicator = result && result._apiType === 'tooling' ? ' 🔧' : '';
+    
     // Store result data for export
     currentResultData = result;
     
-    // Show export buttons if we have exportable data
-    // JSON export: always available if we have any result
+    // Show button group if we have exportable data
     const hasAnyData = (result && typeof result === 'object');
-    document.getElementById('exportJsonBtn').style.display = hasAnyData ? 'inline-block' : 'none';
-    
-    // CSV export: only available for records (SOQL results)
     const hasRecords = (result && (result.records || Array.isArray(result)));
-    document.getElementById('exportCsvBtn').style.display = hasRecords ? 'inline-block' : 'none';
+    const buttonGroup = document.getElementById('buttonGroup');
+    const copyTableBtn = document.getElementById('copyTableBtn');
+    const exportCsvBtn = document.getElementById('exportCsvBtn');
+    
+    if (hasAnyData) {
+        buttonGroup.style.display = 'inline';
+        // Show table/CSV buttons only for record data
+        copyTableBtn.style.display = hasRecords ? 'inline-block' : 'none';
+        exportCsvBtn.style.display = hasRecords ? 'inline-block' : 'none';
+    } else {
+        buttonGroup.style.display = 'none';
+    }
     
     // If table was already rendered progressively, just update the final counter
     if (currentTable && currentTbody) {
         const records = result.records || result;
         const totalSize = result.totalSize || records.length;
         if (totalSize > records.length) {
-            document.getElementById('resultsCount').textContent = `Results: ${records.length} of ${totalSize} (${elapsedSec}s)`;
+            document.getElementById('resultsCount').textContent = `Results: ${records.length} of ${totalSize} (${elapsedSec}s)${apiIndicator}`;
         } else {
-            document.getElementById('resultsCount').textContent = `Results: ${records.length} (${elapsedSec}s)`;
+            document.getElementById('resultsCount').textContent = `Results: ${records.length} (${elapsedSec}s)${apiIndicator}`;
         }
         return;
     }
@@ -1901,7 +1930,7 @@ function renderResult(result, isRerender = false) {
         const tr = document.createElement("tr"); const td = document.createElement("td");
         td.textContent = result.totalSize; tr.appendChild(td); tbody.appendChild(tr); tableEl.appendChild(tbody);
         logContent.appendChild(tableEl);
-        document.getElementById('resultsCount').textContent = `Results: ${result.totalSize} (${elapsedSec}s)`;
+        document.getElementById('resultsCount').textContent = `Results: ${result.totalSize} (${elapsedSec}s)${apiIndicator}`;
         return;
     }
 
@@ -1913,7 +1942,7 @@ function renderResult(result, isRerender = false) {
         pre.textContent = jsonString;
         logContent.appendChild(pre);
         const lineCount = jsonString.split('\n').length;
-        document.getElementById('resultsCount').textContent = `Results: JSON Response (${lineCount} lines, ${elapsedSec}s)`;
+        document.getElementById('resultsCount').textContent = `Results: JSON Response (${lineCount} lines, ${elapsedSec}s)${apiIndicator}`;
         return;
     }
 
@@ -1923,7 +1952,7 @@ function renderResult(result, isRerender = false) {
         emptyEl.className = "log-line";
         emptyEl.textContent = "⚠️ No records returned.";
         logContent.appendChild(emptyEl);
-        document.getElementById('resultsCount').textContent = `Results: 0 (${elapsedSec}s)`;
+        document.getElementById('resultsCount').textContent = `Results: 0 (${elapsedSec}s)${apiIndicator}`;
         return;
     }
 
@@ -2050,9 +2079,9 @@ function renderResult(result, isRerender = false) {
     // Update results counter - show if pagination occurred
     const totalSize = result.totalSize || records.length;
     if (totalSize > records.length) {
-        document.getElementById('resultsCount').textContent = `Results: ${records.length} of ${totalSize} (${elapsedSec}s)`;
+        document.getElementById('resultsCount').textContent = `Results: ${records.length} of ${totalSize} (${elapsedSec}s)${apiIndicator}`;
     } else {
-        document.getElementById('resultsCount').textContent = `Results: ${records.length} (${elapsedSec}s)`;
+        document.getElementById('resultsCount').textContent = `Results: ${records.length} (${elapsedSec}s)${apiIndicator}`;
     }
 }
 
@@ -2318,8 +2347,25 @@ window.fetchSObjects = async function() {
     if (sobjectsCache) return sobjectsCache;
     try {
         const result = await window.api.describeGlobal();
-        sobjectsCache = result.sobjects || [];
-        console.log('Cached', sobjectsCache.length, 'SObjects');
+        const dataSObjects = result.sobjects || [];
+        
+        // Also fetch Tooling API objects and mark them
+        const toolingSObjects = (await window.api.fetchToolingObjects() || []).map(obj => ({
+            ...obj,
+            isTooling: true
+        }));
+        
+        // Merge both lists, removing duplicates by name (prefer Data API version if exists in both)
+        const dataMap = new Map(dataSObjects.map(obj => [obj.name, obj]));
+        const toolingMap = new Map(toolingSObjects.map(obj => [obj.name, obj]));
+        
+        // Combine: data objects first, then tooling-only objects
+        sobjectsCache = [
+            ...dataSObjects,
+            ...toolingSObjects.filter(obj => !dataMap.has(obj.name))
+        ];
+        
+        console.log(`Cached ${sobjectsCache.length} objects (${dataSObjects.length} Data API + ${toolingSObjects.length} Tooling API)`);
         return sobjectsCache;
     } catch (error) {
         console.error('Error fetching SObjects:', error);
@@ -2334,12 +2380,12 @@ window.fetchSObjects = async function() {
 // Fetch and cache fields for a specific object
 // Exposed globally for CodeMirror autocomplete
 window.fetchObjectFields = async function(objectName) {
-    // Normalize to title case for cache lookup
-    const normalizedName = objectName.charAt(0).toUpperCase() + objectName.slice(1).toLowerCase();
+    // Use exact object name casing (Salesforce API is case-sensitive)
+    // Object names should already have correct casing from autocomplete/object list
     
-    if (objectFieldsCache[normalizedName]) return objectFieldsCache[normalizedName];
+    if (objectFieldsCache[objectName]) return objectFieldsCache[objectName];
     try {
-        const result = await window.api.describeObject(normalizedName);
+        const result = await window.api.describeObject(objectName);
         
         // Process fields to identify relationships
         const processedFields = (result.fields || []).map(field => {
@@ -2352,11 +2398,11 @@ window.fetchObjectFields = async function(objectName) {
             };
         });
         
-        objectFieldsCache[normalizedName] = processedFields;
-        console.log('Cached', processedFields.length, 'fields for', normalizedName);
+        objectFieldsCache[objectName] = processedFields;
+        console.log('Cached', processedFields.length, 'fields for', objectName);
         return processedFields;
     } catch (error) {
-        console.error('Error fetching fields for', normalizedName, ':', error);
+        console.error('Error fetching fields for', objectName, ':', error);
         // Check if it's a config error
         if (error.message && error.message.includes('No config selected')) {
             showEnvironmentReminder();
@@ -2424,9 +2470,10 @@ window.getAutocompleteContext = function(text, cursorPos) {
         return null;
     }
     
-    // ===== OBJECT NAME DETECTION =====
-    // Extract current query block and find the object name from FROM clause
+    // ===== REST API SYNTAX DETECTION =====
+    // Check for REST API field list syntax: objectName { "field1", "field2" }
     
+    // First, determine the current block boundaries (same as SOQL detection)
     let blockStart = 0;
     for (let i = cursorPos - 1; i >= 0; i--) {
         if (text[i] === '\n' && (i === 0 || text[i-1] === '\n')) {
@@ -2434,6 +2481,113 @@ window.getAutocompleteContext = function(text, cursorPos) {
             break;
         }
     }
+    
+    // Only search for braces within the current block
+    const textBeforeCursorInBlock = text.substring(blockStart, cursorPos);
+    
+    // Find the innermost unclosed brace within the current block
+    let braceDepth = 0;
+    let lastOpenBrace = -1;
+    let contextBeforeLastBrace = '';
+    
+    for (let i = textBeforeCursorInBlock.length - 1; i >= 0; i--) {
+        if (textBeforeCursorInBlock[i] === '}') {
+            braceDepth++;
+        } else if (textBeforeCursorInBlock[i] === '{') {
+            if (braceDepth === 0) {
+                lastOpenBrace = i;
+                contextBeforeLastBrace = textBeforeCursorInBlock.substring(0, i);
+                break;
+            }
+            braceDepth--;
+        }
+    }
+    
+    if (lastOpenBrace >= 0) {
+        const textInBraces = textBeforeCursorInBlock.substring(lastOpenBrace + 1);
+        
+        // Determine what object/relationship this brace belongs to
+        let baseObjectName = null;
+        let relationshipName = null;
+        
+        // Check if this is a nested relationship: "FieldName": {
+        const nestedMatch = contextBeforeLastBrace.match(/["'](\w+)["']\s*:\s*$/);
+        if (nestedMatch) {
+            relationshipName = nestedMatch[1];
+            
+            // Find the outer object by looking for the previous opening brace
+            let outerBracePos = -1;
+            let outerDepth = 0;
+            for (let i = lastOpenBrace - 1; i >= 0; i--) {
+                if (contextBeforeLastBrace[i] === '}') {
+                    outerDepth++;
+                } else if (contextBeforeLastBrace[i] === '{') {
+                    if (outerDepth === 0) {
+                        outerBracePos = i;
+                        break;
+                    }
+                    outerDepth--;
+                }
+            }
+            
+            if (outerBracePos >= 0) {
+                // Look for object name before the outer brace
+                const outerMatch = contextBeforeLastBrace.substring(0, outerBracePos).match(/\b(\w+)\s*$/);
+                if (outerMatch) {
+                    baseObjectName = outerMatch[1];
+                }
+            } else {
+                // No outer brace, look for object name directly
+                const objMatch = contextBeforeLastBrace.match(/\b(\w+)\s*["'](\w+)["']\s*:\s*$/);
+                if (objMatch) {
+                    baseObjectName = objMatch[1];
+                }
+            }
+            
+            if (baseObjectName && relationshipName) {
+                // Only show autocomplete right after { or right after ,
+                const afterOpenBrace = textInBraces.match(/^\s*["']?(\w*)$/);
+                const afterComma = textInBraces.match(/,\s*["']?(\w*)$/);
+                
+                if (afterOpenBrace || afterComma) {
+                    const restPrefix = afterOpenBrace ? afterOpenBrace[1] : afterComma[1];
+                    return {
+                        type: 'relationship-field',
+                        baseObjectName: baseObjectName,
+                        relationshipName: relationshipName,
+                        prefix: restPrefix,
+                        isRest: true
+                    };
+                }
+                return null;
+            }
+        } else {
+            // Top-level object: objectName { or objectName/id {
+            const objMatch = contextBeforeLastBrace.match(/\b(\w+)(?:\/[a-zA-Z0-9]+)?\s*$/);
+            if (objMatch) {
+                baseObjectName = objMatch[1];
+                
+                // Only show autocomplete right after { or right after ,
+                const afterOpenBrace = textInBraces.match(/^\s*["']?(\w*)$/);
+                const afterComma = textInBraces.match(/,\s*["']?(\w*)$/);
+                
+                if (afterOpenBrace || afterComma) {
+                    const restPrefix = afterOpenBrace ? afterOpenBrace[1] : afterComma[1];
+                    return { 
+                        type: 'field', 
+                        objectName: baseObjectName, 
+                        prefix: restPrefix,
+                        isRest: true 
+                    };
+                }
+                return null;
+            }
+        }
+    }
+    
+    // ===== OBJECT NAME DETECTION =====
+    // (blockStart and textBeforeCursorInBlock already defined above for REST detection)
+    
     let blockEnd = text.length;
     for (let i = cursorPos; i < text.length; i++) {
         if (text[i] === '\n' && (i === text.length - 1 || text[i+1] === '\n')) {
@@ -2442,14 +2596,16 @@ window.getAutocompleteContext = function(text, cursorPos) {
         }
     }
     const queryBlock = text.substring(blockStart, blockEnd).toUpperCase();
+    const textBeforeCursorInBlockUpper = textBeforeCursorInBlock.toUpperCase();
     
     // Find object name from FROM clause (look ahead and in current block)
-    const fromMatchAhead = textAfterCursor.toUpperCase().match(/^FROM\s+(\w+)/);
-    const fromMatchInBlock = queryBlock.match(/\bFROM\s+(\w+)/);
+    // IMPORTANT: Extract from original case-preserving text for Salesforce API case sensitivity
+    const fromMatchAhead = textAfterCursor.match(/^FROM\s+(\w+)/i);
+    const fromMatchInBlock = text.substring(blockStart, blockEnd).match(/\bFROM\s+(\w+)/i);
     const objectName = fromMatchAhead ? fromMatchAhead[1] : (fromMatchInBlock ? fromMatchInBlock[1] : null);
     
     // If typing the object name after FROM, suggest objects
-    if (textBeforeCursorUpper.match(/\bFROM\s*(\w*)$/)) {
+    if (textBeforeCursorInBlockUpper.match(/\bFROM\s*(\w*)$/)) {
         return { type: 'object', prefix: currentWord };
     }
     
@@ -2488,12 +2644,13 @@ window.getAutocompleteContext = function(text, cursorPos) {
     
     // ===== CLAUSE DETECTION =====
     // Determine which SOQL clause we're in and whether to suggest fields
+    // Use textBeforeCursorInBlock to avoid interference from previous queries
     
     if (objectName) {
-        const selectMatch = textBeforeCursorUpper.match(/\bSELECT\b([\s\S]*)$/);
-        const whereMatch = textBeforeCursorUpper.match(/\bWHERE\b([\s\S]*)$/);
-        const orderByMatch = textBeforeCursorUpper.match(/\bORDER\s+BY\b([\s\S]*)$/);
-        const groupByMatch = textBeforeCursorUpper.match(/\bGROUP\s+BY\b([\s\S]*)$/);
+        const selectMatch = textBeforeCursorInBlockUpper.match(/\bSELECT\b([\s\S]*)$/);
+        const whereMatch = textBeforeCursorInBlockUpper.match(/\bWHERE\b([\s\S]*)$/);
+        const orderByMatch = textBeforeCursorInBlockUpper.match(/\bORDER\s+BY\b([\s\S]*)$/);
+        const groupByMatch = textBeforeCursorInBlockUpper.match(/\bGROUP\s+BY\b([\s\S]*)$/);
         
         // SELECT clause - suggest fields before FROM or if FROM is ahead
         if (selectMatch && (!selectMatch[1].includes('FROM') || fromMatchAhead)) {
@@ -2554,7 +2711,8 @@ window.getAutocompleteContext = function(text, cursorPos) {
             }
             
             // After comparison operator - suppress (user is typing a value)
-            if (textAfterWhere.match(/(=|!=|<|>|<=|>=|\bLIKE|\bIN|\bNOT\s+IN)\s*['"]?[\w\s]*$/i)) {
+            // Match quoted strings (with any content) or unquoted single words (no spaces)
+            if (textAfterWhere.match(/(=|!=|<|>|<=|>=|\bLIKE|\bIN|\bNOT\s+IN)\s*(?:'[^']*'?|"[^"]*"?|\w*)$/i)) {
                 return null;
             }
             

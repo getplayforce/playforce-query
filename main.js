@@ -329,6 +329,16 @@ ipcMain.handle('describe-object', async (event, objectName) => {
     }
 });
 
+// Handle fetch tooling objects request
+ipcMain.handle('fetch-tooling-objects', async (event) => {
+    try {
+        return await salesforce.fetchToolingObjects();
+    } catch (error) {
+        console.error('Error fetching tooling objects:', error);
+        throw error;
+    }
+});
+
 // Handle license info request
 ipcMain.handle('get-license-info', async (event) => {
     try {

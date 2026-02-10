@@ -1,7 +1,17 @@
 
+## v0.3.0
+### February, 2026
+- Added field autocomplete & relationship expansion for REST Create & Update (License Required)
+- Added automatic Salesforce Tooling API support (License Required)
+- Tooling API objects visible in autocomplete with 🔧 icon
+- Query execution shows 🔧 indicator for Tooling API operations
+- Use Tooling API objects in SOQL queries & REST operations just like regular objects
+- Added License file
+
+
 ## v0.2.2
 ### January, 2026
-- Add support for Create, Update & Delete. See Help, for REST syntax.
+- Add support for Create, Update & Delete. See Help, for REST syntax.  (License Required)
 - Add 'F5' as an alternate keypress to execute 
 - Add free license requirement for advanced features e.g. Create, Update & Delete. 
 Visit https://getplayforce.com to get a free license and paste it into your .env file
