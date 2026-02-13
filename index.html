@@ -29,7 +29,9 @@ try {
         getLicenseInfo: () => ipcRenderer.invoke('get-license-info'),
         openExternal: (url) => ipcRenderer.invoke('open-external', url),
         openResultWindow: (data) => ipcRenderer.invoke('open-result-window', data),
-        closeAllPopups: () => ipcRenderer.invoke('close-all-popups')
+        closeAllPopups: () => ipcRenderer.invoke('close-all-popups'),
+        fetchIdPrefixes: () => ipcRenderer.invoke('fetch-id-prefixes'),
+        getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId)
     };
 
     // Load CodeMirror editor setup
@@ -716,8 +718,11 @@ async function changeEnvironment() {
             // Auto-authenticate based on grant type
             await autoAuthenticate();
             
-            // Eagerly fetch object list for autocomplete
-            fetchSObjects().catch(err => console.log('Could not pre-fetch objects:', err.message));
+            // Eagerly fetch object list for autocomplete (this populates dataObjectsCache)
+            // Then fetch ID prefixes which will reuse the cache
+            fetchSObjects()
+                .then(() => window.api.fetchIdPrefixes())
+                .catch(err => console.log('Could not pre-fetch metadata:', err.message));
         } else alert('Failed to switch environment');
     } catch(err){ alert(err.message); }
 }
@@ -1397,6 +1402,27 @@ function getObjectTypeFromFieldName(fieldName, rec) {
     return null;
 }
 
+// Get object type from an ID value using ID prefix lookup
+// This is async and should be called with await
+async function getObjectTypeFromIdValue(idValue) {
+    if (!idValue || typeof idValue !== 'string') {
+        return null;
+    }
+    
+    // Salesforce IDs are 15 or 18 characters
+    if (idValue.length !== 15 && idValue.length !== 18) {
+        return null;
+    }
+    
+    try {
+        const objectType = await window.api.getObjectTypeFromId(idValue);
+        return objectType;
+    } catch (error) {
+        console.error('Error getting object type from ID:', error);
+        return null;
+    }
+}
+
 // Add ID click behavior to a cell
 function makeIdClickable(td, objectType, idValue) {
     td.style.color = '#0066cc';
@@ -1408,13 +1434,25 @@ function makeIdClickable(td, objectType, idValue) {
 }
 
 // Handle ID cell click
-function handleIdClick(event, objectType, idValue) {
-    if (!objectType || !idValue) return;
+async function handleIdClick(event, objectType, idValue) {
+    if (!idValue) return;
     
     // Check if user is selecting text - if so, don't trigger navigation
     const selection = window.getSelection();
     if (selection && selection.toString().length > 0) {
         return;
+    }
+    
+    // If objectType is not provided, try to determine it from the ID
+    if (!objectType) {
+        console.log('Object type not provided, determining from ID:', idValue);
+        objectType = await getObjectTypeFromIdValue(idValue);
+        if (!objectType) {
+            console.warn('Could not determine object type for ID:', idValue);
+            alert('Cannot determine object type for this ID');
+            return;
+        }
+        console.log('Determined object type from ID:', objectType);
     }
     
     if (event.ctrlKey || event.metaKey) {
@@ -1580,11 +1618,12 @@ if(window.api?.onSOQLProgress) {
                     }
                     td.textContent = displayVal;
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                    if (h.endsWith('Id') && val && val.length === 18) {
-                        const objectType = getObjectTypeFromFieldName(h, rec);
-                        if (objectType) {
-                            makeIdClickable(td, objectType, val);
-                        }
+                    // Check if this looks like a Salesforce ID (15 or 18 characters)
+                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                    if (looksLikeId) {
+                        // Don't pass objectType - let the click handler determine it from the ID
+                        // This is more accurate than relying on column names
+                        makeIdClickable(td, null, val);
                     }
                 }
                 tr.appendChild(td);
@@ -1696,6 +1735,46 @@ document.addEventListener("keydown",async e=>{
         
         document.body.style.cursor = 'wait';
         try{
+            // Check if the input is just a Salesforce ID (15 or 18 characters)
+            const trimmedBlock = targetBlock.trim();
+            const isSalesforceId = /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(trimmedBlock);
+            
+            if (isSalesforceId) {
+                // Get the object type from the ID
+                const objectType = await window.api.getObjectTypeFromId(trimmedBlock);
+                
+                if (objectType) {
+                    // Replace the ID in the editor with ObjectName/ID
+                    const prefixedValue = `${objectType}/${trimmedBlock}`;
+                    editorView.dispatch({
+                        changes: { from: blockStart, to: blockEnd, insert: prefixedValue },
+                        selection: { anchor: blockStart + prefixedValue.length }
+                    });
+                    
+                    // Update the targetBlock for execution
+                    const result = await window.api.executeREST(prefixedValue);
+                    renderResult(result);
+                } else {
+                    // Unknown ID prefix - show error
+                    clearInterval(queryTimerInterval);
+                    document.getElementById('stopQueryBtn').style.display = 'none';
+                    document.body.style.cursor = 'default';
+                    document.getElementById('convertUtcCheckbox').disabled = false;
+                    
+                    const errEl = document.createElement("div");
+                    errEl.className = "log-line";
+                    errEl.style.color = 'red';
+                    errEl.innerHTML = `Error: Unable to determine object type for ID: ${trimmedBlock}`;
+                    logContent.appendChild(errEl);
+                }
+                
+                clearInterval(queryTimerInterval);
+                document.getElementById('stopQueryBtn').style.display = 'none';
+                document.body.style.cursor = 'default';
+                document.getElementById('convertUtcCheckbox').disabled = false;
+                return;
+            }
+            
             // SOQL only supports SELECT - everything else is REST
             const isSOQL = /^SELECT\b/i.test(targetBlock);
             
@@ -2061,11 +2140,12 @@ function renderResult(result, isRerender = false) {
                 }
                 td.textContent = displayVal;
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                if (h.endsWith('Id') && val && val.length === 18) {
-                    const objectType = getObjectTypeFromFieldName(h, rec);
-                    if (objectType) {
-                        makeIdClickable(td, objectType, val);
-                    }
+                // Check if this looks like a Salesforce ID (15 or 18 characters)
+                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                if (looksLikeId) {
+                    // Don't pass objectType - let the click handler determine it from the ID
+                    // This is more accurate than relying on column names
+                    makeIdClickable(td, null, val);
                 }
             }
             tr.appendChild(td);
@@ -2190,11 +2270,12 @@ function sortTable(columnIndex, fieldName, displayName) {
                 } else {
                     td.textContent = String(val);
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                    if (h.endsWith('Id') && val && val.length === 18) {
-                        const objectType = getObjectTypeFromFieldName(h, rec);
-                        if (objectType) {
-                            makeIdClickable(td, objectType, val);
-                        }
+                    // Check if this looks like a Salesforce ID (15 or 18 characters)
+                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                    if (looksLikeId) {
+                        // Don't pass objectType - let the click handler determine it from the ID
+                        // This is more accurate than relying on column names
+                        makeIdClickable(td, null, val);
                     }
                 }
                 tr.appendChild(td);
@@ -2277,11 +2358,12 @@ function applyFilters() {
             } else {
                 td.textContent = String(val);
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                if (h.endsWith('Id') && val && val.length === 18) {
-                    const objectType = getObjectTypeFromFieldName(h, rec);
-                    if (objectType) {
-                        makeIdClickable(td, objectType, val);
-                    }
+                // Check if this looks like a Salesforce ID (15 or 18 characters)
+                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                if (looksLikeId) {
+                    // Don't pass objectType - let the click handler determine it from the ID
+                    // This is more accurate than relying on column names
+                    makeIdClickable(td, null, val);
                 }
             }
             tr.appendChild(td);

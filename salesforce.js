@@ -28,6 +28,7 @@ if (!fs.existsSync(CONFIGS_DIR)) {
 let currentConfigFile = null;
 let configData = null;
 let tokenCache = {}; // Store tokens per config file: { configFileName: tokenData }
+let idPrefixCache = {}; // Store ID prefix mappings per config: { configFileName: { prefix: objectType } }
 
 function listConfigs() {
     try {
@@ -700,7 +701,7 @@ async function executeREST(path, method = 'GET', body = null, headers = null) {
         const licenseStatus = checkLicense();
         if (!licenseStatus.licensed) {
             const reason = useTooling ? 'Tooling API access' : 'write operations';
-            throw new Error(`License required for ${reason}. ${licenseStatus.message} Visit https://getplayforce.com to get a license and paste it into your .env file.`);
+            throw new Error(`License required for ${reason}. ${licenseStatus.message} Copy .env.example to .env, then visit https://getplayforce.com to get a free license and paste it in.`);
         }
     }
 
@@ -886,6 +887,92 @@ async function describeObject(objectName) {
     });
 }
 
+// Fetch and cache ID prefixes for all objects
+async function fetchIdPrefixes() {
+    console.log('fetchIdPrefixes() called');
+    
+    if (!currentConfigFile) {
+        throw new Error('No config selected');
+    }
+    
+    // Check if already cached for this config
+    if (idPrefixCache[currentConfigFile]) {
+        console.log('Using cached ID prefixes for', path.basename(currentConfigFile));
+        return idPrefixCache[currentConfigFile];
+    }
+    
+    try {
+        let sobjects;
+        
+        // First check if dataObjectsCache already has the sobjects (from fetchSObjects)
+        if (dataObjectsCache[currentConfigFile] && dataObjectsCache[currentConfigFile].length > 0) {
+            console.log('Using sobjects from dataObjectsCache for ID prefixes');
+            sobjects = dataObjectsCache[currentConfigFile];
+        } else {
+            // Fetch describe global to get all objects with their key prefixes
+            // This will also populate dataObjectsCache automatically
+            const describeResult = await describeGlobal();
+            
+            if (!describeResult || !describeResult.sobjects) {
+                console.warn('No sobjects returned from describeGlobal');
+                return {};
+            }
+            
+            sobjects = describeResult.sobjects;
+        }
+        
+        const prefixMap = {};
+        
+        // Build prefix -> object type mapping
+        for (const sobject of sobjects) {
+            if (sobject.keyPrefix) {
+                prefixMap[sobject.keyPrefix] = sobject.name;
+            }
+        }
+        
+        // Cache the result
+        idPrefixCache[currentConfigFile] = prefixMap;
+        console.log(`Cached ${Object.keys(prefixMap).length} ID prefixes for ${path.basename(currentConfigFile)}`);
+        
+        return prefixMap;
+    } catch (error) {
+        console.error('Error fetching ID prefixes:', error);
+        return {};
+    }
+}
+
+// Get object type from a Salesforce ID
+async function getObjectTypeFromId(recordId) {
+    if (!recordId || typeof recordId !== 'string') {
+        return null;
+    }
+    
+    // Salesforce IDs are 15 or 18 characters
+    if (recordId.length !== 15 && recordId.length !== 18) {
+        return null;
+    }
+    
+    // Extract the 3-character prefix
+    const prefix = recordId.substring(0, 3);
+    
+    // Get or fetch the prefix mapping
+    let prefixMap = idPrefixCache[currentConfigFile];
+    
+    if (!prefixMap) {
+        prefixMap = await fetchIdPrefixes();
+    }
+    
+    const objectType = prefixMap[prefix];
+    
+    if (objectType) {
+        console.log(`ID ${recordId} -> prefix ${prefix} -> object type ${objectType}`);
+    } else {
+        console.warn(`Unknown ID prefix: ${prefix} for ID ${recordId}`);
+    }
+    
+    return objectType || null;
+}
+
 function getLicenseInfo() {
     return checkLicense();
 }
@@ -905,7 +992,9 @@ module.exports = {
     describeGlobal,
     describeObject,
     getLicenseInfo,
-    fetchToolingObjects
+    fetchToolingObjects,
+    fetchIdPrefixes,
+    getObjectTypeFromId
 };
 
 console.log('salesforce.js loaded successfully');

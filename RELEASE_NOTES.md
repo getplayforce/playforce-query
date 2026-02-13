@@ -1,4 +1,10 @@
 
+## v0.3.1
+### February, 2026
+- Improved ID navigation accuracy
+- Query on bare IDs: Type or paste any Salesforce ID and press F5 to instantly view the record
+
+
 ## v0.3.0
 ### February, 2026
 - Added field autocomplete & relationship expansion for REST Create & Update (License Required)
@@ -14,7 +20,7 @@
 - Add support for Create, Update & Delete. See Help, for REST syntax.  (License Required)
 - Add 'F5' as an alternate keypress to execute 
 - Add free license requirement for advanced features e.g. Create, Update & Delete. 
-Visit https://getplayforce.com to get a free license and paste it into your .env file
+Copy .env.example to .env, then visit https://getplayforce.com to get a free license and paste it in.
 
 
 ## v0.2.1

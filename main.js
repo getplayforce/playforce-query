@@ -339,6 +339,26 @@ ipcMain.handle('fetch-tooling-objects', async (event) => {
     }
 });
 
+// Handle fetch ID prefixes request
+ipcMain.handle('fetch-id-prefixes', async (event) => {
+    try {
+        return await salesforce.fetchIdPrefixes();
+    } catch (error) {
+        console.error('Error fetching ID prefixes:', error);
+        throw error;
+    }
+});
+
+// Handle get object type from ID request
+ipcMain.handle('get-object-type-from-id', async (event, recordId) => {
+    try {
+        return await salesforce.getObjectTypeFromId(recordId);
+    } catch (error) {
+        console.error('Error getting object type from ID:', error);
+        throw error;
+    }
+});
+
 // Handle license info request
 ipcMain.handle('get-license-info', async (event) => {
     try {
