@@ -1423,13 +1423,33 @@ async function getObjectTypeFromIdValue(idValue) {
     }
 }
 
+// Linkify Salesforce IDs in JSON text
+function linkifyIdsInJson(jsonText) {
+    // Match quoted strings that look like Salesforce IDs (15 or 18 alphanumeric characters)
+    // Look for values (after ": ") not keys
+    const idPattern = /:\s*"([a-zA-Z0-9]{15}|[a-zA-Z0-9]{18})"/g;
+    
+    return jsonText.replace(idPattern, (match, idValue) => {
+        // Validation to avoid false positives:
+        // - Must contain at least one digit (IDs always have numbers)
+        // - Must contain at least one letter (IDs have prefix letters)
+        // - Must not be all the same character
+        if (!/\d/.test(idValue) || !/[a-zA-Z]/.test(idValue) || /^(.)\1+$/.test(idValue)) {
+            return match; // Not an ID, return unchanged
+        }
+        
+        // Create a styled link with data attribute
+        return `: "<span class="json-id-link" data-id="${idValue}" style="color:#0066cc; cursor:pointer; text-decoration:underline;" title="Click to view, Ctrl+Click to copy, Alt+Click to open in Salesforce">${idValue}</span>"`;
+    });
+}
+
 // Add ID click behavior to a cell
 function makeIdClickable(td, objectType, idValue) {
     td.style.color = '#0066cc';
     td.style.cursor = 'pointer';
     td.style.textDecoration = 'underline';
     td.style.userSelect = 'text';
-    td.title = 'Click to view, Ctrl+Click for Salesforce, or select to copy';
+    td.title = 'Click to view, Ctrl+Click to copy, Alt+Click to open in Salesforce';
     td.addEventListener('click', (e) => handleIdClick(e, objectType, idValue));
 }
 
@@ -1456,7 +1476,25 @@ async function handleIdClick(event, objectType, idValue) {
     }
     
     if (event.ctrlKey || event.metaKey) {
-        // Ctrl+click: Open in Salesforce
+        // Ctrl+click: Copy ID to clipboard
+        event.preventDefault();
+        event.stopPropagation();
+        console.log('Ctrl+click detected, copying ID:', idValue);
+        navigator.clipboard.writeText(idValue).then(() => {
+            console.log('ID copied to clipboard successfully:', idValue);
+            // Show brief visual feedback on the clicked element
+            const target = event.target;
+            const originalBg = target.style.backgroundColor;
+            target.style.backgroundColor = '#d4edda';
+            setTimeout(() => {
+                target.style.backgroundColor = originalBg;
+            }, 800);
+        }).catch(err => {
+            console.error('Failed to copy ID:', err);
+            alert('Failed to copy: ' + err.message);
+        });
+    } else if (event.altKey) {
+        // Alt+click: Open in Salesforce
         const currentConfig = document.getElementById('envSelector').value;
         if (!currentConfig) {
             alert('No environment selected');
@@ -1532,8 +1570,30 @@ if(window.api?.onSOQLProgress) {
                 const th = document.createElement("th"); 
                 th.textContent = lbl; 
                 th.className = 'sortable';
+                th.title = 'Click to sort, Ctrl+click to copy column name';
                 th.dataset.columnIndex = idx;
-                th.addEventListener('click', () => sortTable(idx, headers[idx], lbl));
+                th.dataset.fieldName = headers[idx];
+                th.addEventListener('click', (e) => {
+                    if (e.ctrlKey || e.metaKey) {
+                        // Copy column name
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('Copying column name:', headers[idx]);
+                        navigator.clipboard.writeText(headers[idx]).then(() => {
+                            console.log('Column name copied successfully:', headers[idx]);
+                            const originalBg = th.style.backgroundColor;
+                            th.style.backgroundColor = '#d4edda';
+                            setTimeout(() => {
+                                th.style.backgroundColor = originalBg;
+                            }, 800);
+                        }).catch(err => {
+                            console.error('Failed to copy column name:', err);
+                            alert('Failed to copy: ' + err.message);
+                        });
+                    } else {
+                        sortTable(idx, headers[idx], lbl);
+                    }
+                });
                 headerRow.appendChild(th); 
             });
             thead.appendChild(headerRow);
@@ -1618,8 +1678,8 @@ if(window.api?.onSOQLProgress) {
                     }
                     td.textContent = displayVal;
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                    // Check if this looks like a Salesforce ID (15 or 18 characters)
-                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                    // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
+                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
                     if (looksLikeId) {
                         // Don't pass objectType - let the click handler determine it from the ID
                         // This is more accurate than relying on column names
@@ -2018,7 +2078,18 @@ function renderResult(result, isRerender = false) {
         // Apply datetime conversion if enabled
         const displayData = convertUtcToLocal ? convertDatetimesInObject(result) : result;
         const jsonString = JSON.stringify(displayData, null, 2);
-        pre.textContent = jsonString;
+        const linkedJson = linkifyIdsInJson(jsonString);
+        pre.innerHTML = linkedJson;
+        
+        // Add click handlers to all ID links
+        pre.addEventListener('click', async (e) => {
+            if (e.target.classList.contains('json-id-link')) {
+                console.log('JSON ID link clicked:', e.target.dataset.id, 'ctrlKey:', e.ctrlKey, 'altKey:', e.altKey);
+                const idValue = e.target.dataset.id;
+                await handleIdClick(e, null, idValue);
+            }
+        });
+        
         logContent.appendChild(pre);
         const lineCount = jsonString.split('\n').length;
         document.getElementById('resultsCount').textContent = `Results: JSON Response (${lineCount} lines, ${elapsedSec}s)${apiIndicator}`;
@@ -2061,8 +2132,30 @@ function renderResult(result, isRerender = false) {
         const th = document.createElement("th"); 
         th.textContent = lbl; 
         th.className = 'sortable';
+        th.title = 'Click to sort, Ctrl+click to copy column name';
         th.dataset.columnIndex = idx;
-        th.addEventListener('click', () => sortTable(idx, headers[idx], lbl));
+        th.dataset.fieldName = headers[idx];
+        th.addEventListener('click', (e) => {
+            if (e.ctrlKey || e.metaKey) {
+                // Copy column name
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('Copying column name:', headers[idx]);
+                navigator.clipboard.writeText(headers[idx]).then(() => {
+                    console.log('Column name copied successfully:', headers[idx]);
+                    const originalBg = th.style.backgroundColor;
+                    th.style.backgroundColor = '#d4edda';
+                    setTimeout(() => {
+                        th.style.backgroundColor = originalBg;
+                    }, 800);
+                }).catch(err => {
+                    console.error('Failed to copy column name:', err);
+                    alert('Failed to copy: ' + err.message);
+                });
+            } else {
+                sortTable(idx, headers[idx], lbl);
+            }
+        });
         headerRow.appendChild(th); 
     });
     thead.appendChild(headerRow);
@@ -2140,8 +2233,8 @@ function renderResult(result, isRerender = false) {
                 }
                 td.textContent = displayVal;
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                // Check if this looks like a Salesforce ID (15 or 18 characters)
-                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
+                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
                 if (looksLikeId) {
                     // Don't pass objectType - let the click handler determine it from the ID
                     // This is more accurate than relying on column names
@@ -2270,8 +2363,8 @@ function sortTable(columnIndex, fieldName, displayName) {
                 } else {
                     td.textContent = String(val);
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                    // Check if this looks like a Salesforce ID (15 or 18 characters)
-                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                    // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
+                    const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
                     if (looksLikeId) {
                         // Don't pass objectType - let the click handler determine it from the ID
                         // This is more accurate than relying on column names
@@ -2358,8 +2451,8 @@ function applyFilters() {
             } else {
                 td.textContent = String(val);
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
-                // Check if this looks like a Salesforce ID (15 or 18 characters)
-                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18);
+                // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
+                const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
                 if (looksLikeId) {
                     // Don't pass objectType - let the click handler determine it from the ID
                     // This is more accurate than relying on column names

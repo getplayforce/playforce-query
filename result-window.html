@@ -72,6 +72,15 @@ pre:focus { outline:none; }
 <script>
 const { ipcRenderer } = require('electron');
 
+// Setup API bridge
+window.api = {
+    executeREST: (path, method = 'GET', body = null, headers = null) => ipcRenderer.invoke('execute-rest', path, method, body, headers),
+    getCurrentConfig: () => ipcRenderer.invoke('get-current-config'),
+    openExternal: (url) => ipcRenderer.invoke('open-external', url),
+    openResultWindow: (data) => ipcRenderer.invoke('open-result-window', data),
+    getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId)
+};
+
 // UTC to Local conversion state
 let convertUtcToLocal = false;
 let originalResultData = null;
@@ -138,6 +147,83 @@ function convertDatetimesInObject(obj) {
     return obj;
 }
 
+// Linkify Salesforce IDs in JSON text
+function linkifyIdsInJson(jsonText) {
+    // Match quoted strings that look like Salesforce IDs (15 or 18 alphanumeric characters)
+    // Look for values (after ": ") not keys
+    const idPattern = /:\s*"([a-zA-Z0-9]{15}|[a-zA-Z0-9]{18})"/g;
+    
+    return jsonText.replace(idPattern, (match, idValue) => {
+        // Validation to avoid false positives:
+        // - Must contain at least one digit (IDs always have numbers)
+        // - Must contain at least one letter (IDs have prefix letters)
+        // - Must not be all the same character
+        if (!/\d/.test(idValue) || !/[a-zA-Z]/.test(idValue) || /^(.)\1+$/.test(idValue)) {
+            return match; // Not an ID, return unchanged
+        }
+        
+        // Create a styled link with data attribute
+        return `: "<span class="json-id-link" data-id="${idValue}" style="color:#0066cc; cursor:pointer; text-decoration:underline;" title="Click to view, Ctrl+Click to copy, Alt+Click to open in Salesforce">${idValue}</span>"`;
+    });
+}
+
+// Handle ID click in JSON
+async function handleIdClick(event, idValue) {
+    if (!idValue) return;
+    
+    // Check if user is selecting text - if so, don't trigger navigation
+    const selection = window.getSelection();
+    if (selection && selection.toString().length > 0) {
+        return;
+    }
+    
+    if (event.ctrlKey || event.metaKey) {
+        // Ctrl+click: Copy ID to clipboard
+        event.preventDefault();
+        event.stopPropagation();
+        console.log('Ctrl+click detected, copying ID:', idValue);
+        navigator.clipboard.writeText(idValue).then(() => {
+            console.log('ID copied to clipboard successfully:', idValue);
+            // Show brief visual feedback
+            const target = event.target;
+            const originalBg = target.style.backgroundColor;
+            target.style.backgroundColor = '#d4edda';
+            setTimeout(() => {
+                target.style.backgroundColor = originalBg;
+            }, 800);
+        }).catch(err => {
+            console.error('Failed to copy ID:', err);
+            alert('Failed to copy: ' + err.message);
+        });
+    } else if (event.altKey) {
+        // Alt+click: Open in Salesforce
+        try {
+            const config = await window.api.getCurrentConfig();
+            if (config && config.instanceUrl) {
+                const url = `${config.instanceUrl}/${idValue}`;
+                await window.api.openExternal(url);
+            }
+        } catch (error) {
+            console.error('Error opening in Salesforce:', error);
+        }
+    } else {
+        // Regular click: View details
+        try {
+            // Determine object type from ID
+            const objectType = await window.api.getObjectTypeFromId(idValue);
+            if (objectType) {
+                const result = await window.api.executeREST(`${objectType}/${idValue}`);
+                await window.api.openResultWindow(result);
+            } else {
+                alert('Cannot determine object type for this ID');
+            }
+        } catch (error) {
+            console.error('Error fetching record:', error);
+            alert('Error fetching record: ' + error.message);
+        }
+    }
+}
+
 // Toggle UTC to local datetime conversion
 function toggleUtcConversion() {
     const checkbox = document.getElementById('convertUtcCheckbox');
@@ -160,8 +246,19 @@ function renderResult(resultData, isToggle = false) {
     const pre = document.createElement('pre');
     const displayData = convertUtcToLocal ? convertDatetimesInObject(resultData) : resultData;
     const jsonText = JSON.stringify(displayData, null, 2);
-    pre.textContent = jsonText;
+    const linkedJson = linkifyIdsInJson(jsonText);
+    pre.innerHTML = linkedJson;
     pre.tabIndex = 0;
+    
+    // Add click handlers to all ID links
+    pre.addEventListener('click', async (e) => {
+        if (e.target.classList.contains('json-id-link')) {
+            console.log('JSON ID link clicked:', e.target.dataset.id, 'ctrlKey:', e.ctrlKey, 'altKey:', e.altKey);
+            const idValue = e.target.dataset.id;
+            await handleIdClick(e, idValue);
+        }
+    });
+    
     contentDiv.innerHTML = '';
     contentDiv.appendChild(pre);
     

@@ -1,4 +1,12 @@
 
+## v0.3.2
+### February, 2026
+- Salesforce IDs in JSON responses are now clickable links
+- Enhanced ID interaction: Click to view, Ctrl+Click to copy, Alt+Click to open in Salesforce
+- Ctrl+Click column headers to copy column names to clipboard
+
+
+
 ## v0.3.1
 ### February, 2026
 - Improved ID navigation accuracy
