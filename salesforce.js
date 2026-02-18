@@ -29,6 +29,7 @@ let currentConfigFile = null;
 let configData = null;
 let tokenCache = {}; // Store tokens per config file: { configFileName: tokenData }
 let idPrefixCache = {}; // Store ID prefix mappings per config: { configFileName: { prefix: objectType } }
+let apiVersionCache = {}; // Store API versions per config file: { configFileName: apiVersion }
 
 function listConfigs() {
     try {
@@ -74,11 +75,6 @@ function loadConfig() {
             console.log('Loading config from:', currentConfigFile);
             configData = JSON.parse(fs.readFileSync(currentConfigFile, "utf-8"));
             console.log('Config loaded successfully');
-
-            // Apply defaults if missing
-            if (!configData.apiVersion) {
-                configData.apiVersion = "v57.0"; // default API version
-            }
 
             // Automatic grant_type determination - only if not explicitly set
             if (!configData.grant_type) {
@@ -289,6 +285,105 @@ function extractObjectName(query) {
 let toolingObjectsCache = {}; // Store per config file: { configFileName: objectNames[] }
 let dataObjectsCache = {}; // Store per config file: { configFileName: objectNames[] }
 
+// Fetch available API versions from Salesforce and return the latest
+async function fetchApiVersion() {
+    try {
+        // Need to get instance URL first - either from token or config
+        let instanceUrl;
+        let token = null;
+        const tokenData = loadToken();
+        
+        if (tokenData && tokenData.instance_url) {
+            instanceUrl = tokenData.instance_url;
+            token = tokenData.access_token;
+        } else {
+            // Try to get instance URL from login_url in config
+            const config = loadConfig();
+            if (!config || !config.login_url) {
+                console.warn('Cannot fetch API version: no instance URL available');
+                return 'v57.0'; // fallback default
+            }
+            instanceUrl = config.login_url;
+        }
+        
+        const url = `${instanceUrl}/services/data/`;
+        console.log('Fetching available API versions from:', url);
+        
+        const headers = {
+            "Content-Type": "application/json"
+        };
+        
+        // Add authorization if token is available
+        if (token) {
+            headers["Authorization"] = `Bearer ${token}`;
+        }
+        
+        const res = await fetch(url, {
+            headers
+        });
+        
+        if (!res.ok) {
+            const text = await res.text();
+            console.error('Failed to fetch API versions:', text);
+            return 'v57.0'; // fallback default
+        }
+        
+        const versions = await res.json();
+        
+        if (!Array.isArray(versions) || versions.length === 0) {
+            console.error('No API versions returned from Salesforce');
+            return 'v57.0'; // fallback default
+        }
+        
+        console.log(`Received ${versions.length} API versions from Salesforce`);
+        
+        // Use a stable version (second-to-last or latest if only one exists)
+        // This avoids using preview/beta versions that might not be fully available
+        const versionIndex = versions.length > 1 ? versions.length - 2 : versions.length - 1;
+        const selectedVersion = versions[versionIndex];
+        let apiVersion = selectedVersion.version;
+        
+        // Ensure version has 'v' prefix (e.g., "v65.0" not "65.0")
+        if (!apiVersion.startsWith('v')) {
+            apiVersion = 'v' + apiVersion;
+        }
+        
+        console.log(`Selected API version: ${apiVersion} (using index ${versionIndex} of ${versions.length} versions for stability)`);
+        
+        // Cache per environment
+        if (currentConfigFile) {
+            apiVersionCache[currentConfigFile] = apiVersion;
+        }
+        
+        return apiVersion;
+    } catch (error) {
+        console.error('Error fetching API versions:', error);
+        return 'v57.0'; // fallback default
+    }
+}
+
+// Get API version - from config, cache, or dynamically fetch
+async function getApiVersion() {
+    const config = loadConfig();
+    
+    // Priority 1: Use explicitly configured API version
+    if (config && config.apiVersion) {
+        console.log(`Using configured API version: ${config.apiVersion}`);
+        return config.apiVersion;
+    }
+    
+    // Priority 2: Use cached API version for this config
+    if (currentConfigFile && apiVersionCache[currentConfigFile]) {
+        console.log(`Using cached API version: ${apiVersionCache[currentConfigFile]}`);
+        return apiVersionCache[currentConfigFile];
+    }
+    
+    // Priority 3: Fetch from Salesforce
+    console.log('No API version configured, fetching from Salesforce...');
+    const fetchedVersion = await fetchApiVersion();
+    return fetchedVersion;
+}
+
 // Fetch list of Tooling API objects from Salesforce
 async function fetchToolingObjects() {
     try {
@@ -298,7 +393,7 @@ async function fetchToolingObjects() {
             return null;
         }
         
-        const apiVersion = config.apiVersion;
+        const apiVersion = await getApiVersion();
         const { token, instanceUrl } = await getAccessToken();
         
         const url = `${instanceUrl}/services/data/${apiVersion}/tooling/sobjects/`;
@@ -469,7 +564,7 @@ async function executeSOQL(query, onProgress = null, abortSignal = null) {
     query = await expandSelectStar(query);
     
     const config = loadConfig();
-    const apiVersion = config.apiVersion;
+    const apiVersion = await getApiVersion();
 
     return await withTokenRetry(async (token, instanceUrl) => {
         if (!token || !instanceUrl) {
@@ -691,7 +786,7 @@ CQIDAQAB
 
 async function executeREST(path, method = 'GET', body = null, headers = null) {
     const config = loadConfig();
-    const apiVersion = config.apiVersion;
+    const apiVersion = await getApiVersion();
     
     // Detect if this path uses Tooling API objects
     const useTooling = shouldUseToolingAPI(path);
@@ -814,7 +909,7 @@ async function describeGlobal() {
     if (!config) {
         throw new Error('No config selected. Please select an environment first.');
     }
-    const apiVersion = config.apiVersion;
+    const apiVersion = await getApiVersion();
 
     return await withTokenRetry(async (token, instanceUrl) => {
         if (!token || !instanceUrl) {
@@ -855,7 +950,7 @@ async function describeObject(objectName) {
     if (!config) {
         throw new Error('No config selected. Please select an environment first.');
     }
-    const apiVersion = config.apiVersion;
+    const apiVersion = await getApiVersion();
     
     // Detect if this object uses Tooling API
     const useTooling = shouldUseToolingAPI(objectName);
@@ -977,6 +1072,34 @@ function getLicenseInfo() {
     return checkLicense();
 }
 
+// Fetch the active UI theme from Salesforce to get the org's header color
+async function fetchActiveTheme() {
+    const apiVersion = await getApiVersion();
+
+    return await withTokenRetry(async (token, instanceUrl) => {
+        if (!token || !instanceUrl) {
+            ({ token, instanceUrl } = await getAccessToken());
+        }
+
+        const url = `${instanceUrl}/services/data/${apiVersion}/ui-api/themes/active`;
+        console.log('Fetching active theme from:', url);
+
+        const res = await fetch(url, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Failed to fetch active theme: ${text}`);
+        }
+
+        return await res.json();
+    });
+}
+
 module.exports = {
     executeSOQL,
     executeREST,
@@ -994,7 +1117,9 @@ module.exports = {
     getLicenseInfo,
     fetchToolingObjects,
     fetchIdPrefixes,
-    getObjectTypeFromId
+    getObjectTypeFromId,
+    getApiVersion,
+    fetchActiveTheme,
 };
 
 console.log('salesforce.js loaded successfully');

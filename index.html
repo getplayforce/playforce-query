@@ -31,7 +31,8 @@ try {
         openResultWindow: (data) => ipcRenderer.invoke('open-result-window', data),
         closeAllPopups: () => ipcRenderer.invoke('close-all-popups'),
         fetchIdPrefixes: () => ipcRenderer.invoke('fetch-id-prefixes'),
-        getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId)
+        getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId),
+        fetchActiveTheme: () => ipcRenderer.invoke('fetch-active-theme')
     };
 
     // Load CodeMirror editor setup
@@ -723,8 +724,39 @@ async function changeEnvironment() {
             fetchSObjects()
                 .then(() => window.api.fetchIdPrefixes())
                 .catch(err => console.log('Could not pre-fetch metadata:', err.message));
+
+            // Fetch org theme and apply header color
+            applyOrgTheme();
         } else alert('Failed to switch environment');
     } catch(err){ alert(err.message); }
+}
+
+// Fetch org theme and apply header color to toolbar
+async function applyOrgTheme() {
+    try {
+        const theme = await window.api.fetchActiveTheme();
+        if (theme && theme.headerColor) {
+            const toolbar = document.getElementById('toolbar');
+            toolbar.style.background = theme.headerColor;
+            toolbar.style.borderBottom = '1px solid #ccc';
+            toolbar.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
+            // Auto-detect if color is dark to flip text/button colors
+            const hex = theme.headerColor.replace('#', '');
+            const r = parseInt(hex.substring(0, 2), 16);
+            const g = parseInt(hex.substring(2, 4), 16);
+            const b = parseInt(hex.substring(4, 6), 16);
+            const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+            const isDark = luminance < 0.5;
+            toolbar.style.color = isDark ? '#fff' : '#333';
+            // Update version/help text color
+            toolbar.querySelectorAll('span[style*="color:#666"], span[style*="color:#999"]').forEach(el => {
+                el.style.color = isDark ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.6)';
+            });
+            console.log(`Applied org theme color: ${theme.headerColor} (${isDark ? 'dark' : 'light'})`);
+        }
+    } catch (err) {
+        console.log('Could not apply org theme:', err.message);
+    }
 }
 
 // Auto-authenticate based on grant type

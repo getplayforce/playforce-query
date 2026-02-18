@@ -49,7 +49,9 @@ Playforce Query uses **automatic authentication detection** with the following p
 - `password`: Salesforce password 
   -  If a security token is required (for example, if the user's IP address is not trusted) + security token concatenated 
   -  Example: `"password": "MyPasswordMYSECURITYTOKEN"`
-- `apiVersion`: Salesforce API version (default: `v57.0`)
+- `apiVersion`: Salesforce API version (optional - auto-detected if not specified)
+  - **If omitted**: Automatically fetches and uses a stable version from Salesforce
+  - **If specified**: Uses the exact version you provide (useful for pinning to a specific version)
   - Examples: `"v58.0"`, `"v59.0"`, `"v60.0"`
   - Format: Must include the `v` prefix
 
@@ -112,7 +114,19 @@ Playforce Query can facilitate CUD operations. If you need to grant or deny for 
 
 ## Configuration Examples
 
-### OAuth-Ready Config
+### OAuth-Ready Config (Recommended)
+
+```json
+{
+  "client_id": "3MVG9...",
+  "client_secret": "ABC123...",
+  "login_url": "https://login.salesforce.com"
+}
+```
+
+**Behavior**: Automatically detects API version, tries client credentials, switches to OAuth if needed.
+
+### OAuth Config with Pinned API Version
 
 ```json
 {
@@ -123,7 +137,7 @@ Playforce Query can facilitate CUD operations. If you need to grant or deny for 
 }
 ```
 
-**Behavior**: Tries client credentials, switches to OAuth if needed.
+**Behavior**: Uses the specified API version, tries client credentials, switches to OAuth if needed.
 
 ### Password Grant
 
@@ -133,26 +147,31 @@ Playforce Query can facilitate CUD operations. If you need to grant or deny for 
   "client_secret": "ABC123...",  
   "username": "user@example.com",
   "password": "MyPassword123SecToken456",
-  "login_url": "https://login.salesforce.com",
-  "apiVersion": "v58.0"
+  "login_url": "https://login.salesforce.com"
 }
 ```
 
-**Behavior**: Uses password grant automatically (no OAuth needed).
+**Behavior**: Uses password grant automatically with auto-detected API version (no OAuth needed).
 
 **Important notes:**
 - The `password` field may optionally require your security token appended to your password. Required for example, if the user's IP address is not trusted
   - e.g. If password is `MyPassword123` and token is `SecToken456`, use `MyPassword123SecToken456`
 - Security tokens can be reset from Salesforce under: Setup → My Personal Information → Reset My Security Token
+- `apiVersion` is optional - omit it to use automatic version detection
 
 
 ## API Version
 
-The `apiVersion` field specifies which Salesforce REST API version to use:
+The `apiVersion` field specifies which Salesforce REST API version to use. **This field is optional** with automatic version detection:
 
-- **Default**: `v58.0` (if not specified)
-- **Format**: Must include the `v` prefix (e.g., `"v58.0"`, `"v59.0"`)
-- **Behavior**: This version is used for all SOQL and REST API calls
+
+**Format Requirements**:
+- Must include the `v` prefix (e.g., `"v58.0"`, `"v59.0"`)
+- Use the format `vXX.0` where XX is the version number
+
+### Fallback Behavior
+
+If automatic version detection fails (e.g., network issues), the system falls back to `v57.0`.
 
 ## Login URL Behavior
 
@@ -197,6 +216,13 @@ The `login_url` determines which Salesforce instance to authenticate against:
 ### External Client App not working immediately
 - **Cause**: Salesforce takes 2-10 minutes to propagate new External Client Apps
 - **Solution**: Wait a few minutes after creating the External Client App, then try again
+
+### "The requested resource does not exist" or API version errors
+- **Cause**: Invalid API version or version format
+- **Solution**: 
+  - Remove the `apiVersion` field from your config to use automatic detection
+  - If specifying manually, ensure format is correct (e.g., `"v58.0"` not `"58.0"`)
+  - Check the console logs to see which version was detected/used
 
 
 

@@ -1,4 +1,9 @@
 
+## v0.3.3
+### February, 2026
+- Automatic API version detection - dynamically fetches available versions from Salesforce, using second-to-latest for stability
+- Toolbar now reflects your org's brand color 
+
 ## v0.3.2
 ### February, 2026
 - Salesforce IDs in JSON responses are now clickable links

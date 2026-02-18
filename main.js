@@ -369,6 +369,15 @@ ipcMain.handle('get-license-info', async (event) => {
     }
 });
 
+ipcMain.handle('fetch-active-theme', async (event) => {
+    try {
+        return await salesforce.fetchActiveTheme();
+    } catch (error) {
+        console.error('Error fetching active theme:', error);
+        return null;
+    }
+});
+
 // Open external URL in system browser
 ipcMain.handle('open-external', async (event, url) => {
     try {
