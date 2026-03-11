@@ -1,6 +1,6 @@
 {
   "name": "Playforce Query",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "main": "main.js",
   "engines": {
     "node": ">=20.0.0",
