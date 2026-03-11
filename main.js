@@ -232,6 +232,8 @@ ipcMain.handle('exchange-auth-code', async (event, authCode, redirectUri) => {
 // Track abort controllers for each query
 const abortControllers = new Map();
 const lastProgressData = new Map(); // Store last progress update for each query
+const restAbortControllers = new Map();
+const lastRestProgressData = new Map();
 
 // Handle SOQL execution with pagination progress
 ipcMain.handle('execute-soql', async (event, query, queryId) => {
@@ -292,6 +294,15 @@ ipcMain.handle('abort-query', async (event, queryId) => {
             abortControllers.delete(queryId);
             return { success: true };
         }
+
+        const restController = restAbortControllers.get(queryId);
+        if (restController) {
+            console.log('Aborting REST query:', queryId);
+            restController.abort();
+            restAbortControllers.delete(queryId);
+            return { success: true };
+        }
+
         return { success: false, error: 'Query not found' };
     } catch (error) {
         console.error('Error aborting query:', error);
@@ -300,10 +311,54 @@ ipcMain.handle('abort-query', async (event, queryId) => {
 });
 
 // Handle REST execution
-ipcMain.handle('execute-rest', async (event, path, method = 'GET', body = null, headers = null) => {
+ipcMain.handle('execute-rest', async (event, path, method = 'GET', body = null, headers = null, requestId = null, apiMode = null) => {
     try {
-        return await salesforce.executeREST(path, method, body, headers);
+        const abortController = new AbortController();
+        if (requestId) {
+            restAbortControllers.set(requestId, abortController);
+        }
+
+        const result = await salesforce.executeREST(path, method, body, headers, (progress) => {
+            if (requestId) {
+                lastRestProgressData.set(requestId, progress);
+            }
+            event.sender.send('rest-progress', {
+                requestId,
+                ...progress
+            });
+        }, abortController.signal, apiMode);
+
+        if (requestId) {
+            restAbortControllers.delete(requestId);
+            lastRestProgressData.delete(requestId);
+        }
+
+        return result;
     } catch (error) {
+        if (requestId) {
+            restAbortControllers.delete(requestId);
+        }
+
+        if (error.name === 'AbortError' || error.message?.includes('aborted') || error.message?.includes('AbortError')) {
+            const partialData = requestId ? lastRestProgressData.get(requestId) : null;
+            if (requestId) {
+                lastRestProgressData.delete(requestId);
+            }
+
+            if (partialData?.result) {
+                return {
+                    ...partialData.result,
+                    aborted: true,
+                    _abortedPending: Array.isArray(partialData.pending) ? partialData.pending : []
+                };
+            }
+
+            return {
+                aborted: true,
+                _abortedPending: []
+            };
+        }
+
         console.error('Error executing REST:', error);
         throw error;
     }
@@ -437,10 +492,15 @@ ipcMain.handle('open-result-window', async (event, data) => {
         if (!global.resultWindowData) {
             global.resultWindowData = {};
         }
-        // Store both data and conversion state
+        const normalizedPayload = (data && typeof data === 'object' && (Object.prototype.hasOwnProperty.call(data, 'data') || Object.prototype.hasOwnProperty.call(data, 'request') || Object.prototype.hasOwnProperty.call(data, 'convertUtcToLocal')))
+            ? data
+            : { data };
+
+        // Store both preloaded data and request mode payloads
         global.resultWindowData[windowId] = {
-            data: data.data || data, // Support both old and new format
-            convertUtcToLocal: data.convertUtcToLocal || false
+            data: Object.prototype.hasOwnProperty.call(normalizedPayload, 'data') ? normalizedPayload.data : null,
+            request: normalizedPayload.request || null,
+            convertUtcToLocal: normalizedPayload.convertUtcToLocal || false
         };
         
         // Clean up when window is closed

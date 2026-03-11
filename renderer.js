@@ -111,10 +111,12 @@ window.createCodeMirrorEditor = function(parent) {
           const objName = typeof obj === 'string' ? obj : obj.name;
           const objLabel = typeof obj === 'object' ? obj.label : '';
           const isTooling = obj.isTooling === true;
+          const isBoth = obj.isBoth === true;
+          const sourcePrefix = isBoth ? '🔩 ' : (isTooling ? '⚙️ ' : '');
           return {
             label: objName,
             type: "class",
-            detail: isTooling ? `🔧 ${objLabel}` : objLabel
+            detail: `${sourcePrefix}${objLabel}`.trim()
           };
         });
       } else if (acContext.type === 'field') {

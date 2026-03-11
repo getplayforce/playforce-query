@@ -31,6 +31,8 @@ pre:focus { outline:none; }
 .search-box button:hover { background:#0052a3; }
 .search-highlight { background:#ffff00; color:#000; }
 .search-current { background:#ff6600; color:#fff; }
+#stopRequestBtn { padding:4px 8px; font-size:12px; cursor:pointer; background:#dc3545; color:white; border:none; border-radius:4px; display:none; }
+#stopRequestBtn:hover { background:#c82333; }
 </style>
 </head>
 <body>
@@ -45,13 +47,23 @@ pre:focus { outline:none; }
     <div class="header">
         <div>
             <h1>REST API Result</h1>
-            <div id="lineCountInfo" style="font-size:12px; color:#666; margin-top:4px;"></div>
+            <div style="display:flex; align-items:center; gap:6px; margin-top:2px;">
+                <div id="lineCountInfo" style="font-size:12px; color:#666;"></div>
+                <label id="jsonFieldModeContainer" style="display:none; align-items:center; gap:4px; font-size:12px;" title="Choose which fields to show in JSON view">
+                    <select id="jsonFieldMode" onchange="toggleJsonFieldMode()" style="font-size:12px; padding:2px 4px;">
+                        <option value="data">Data Only</option>
+                        <option value="tooling">Tooling Only</option>
+                        <option value="both" selected>Data + Tooling</option>
+                    </select>
+                </label>
+            </div>
         </div>
         <div style="display:flex; gap:8px; align-items:center;">
             <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;" title="Convert UTC datetime to local timezone">
                 <input type="checkbox" id="convertUtcCheckbox" onchange="toggleUtcConversion()" style="cursor:pointer;">
                 <span>Local Time</span>
             </label>
+            <button id="stopRequestBtn" onclick="stopPopupRequest()">⏹ Stop (Esc)</button>
             <span id="buttonGroup" style="display:none;">
                 <button id="copyBtn" class="action-btn">Copy JSON</button>
                 <button id="exportBtn" class="action-btn">Export JSON</button>
@@ -74,16 +86,38 @@ const { ipcRenderer } = require('electron');
 
 // Setup API bridge
 window.api = {
-    executeREST: (path, method = 'GET', body = null, headers = null) => ipcRenderer.invoke('execute-rest', path, method, body, headers),
+    executeREST: (path, method = 'GET', body = null, headers = null, requestId = null, apiMode = null) => ipcRenderer.invoke('execute-rest', path, method, body, headers, requestId, apiMode),
+    abortQuery: (queryId) => ipcRenderer.invoke('abort-query', queryId),
+    getLicenseInfo: () => ipcRenderer.invoke('get-license-info'),
     getCurrentConfig: () => ipcRenderer.invoke('get-current-config'),
     openExternal: (url) => ipcRenderer.invoke('open-external', url),
     openResultWindow: (data) => ipcRenderer.invoke('open-result-window', data),
-    getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId)
+    getObjectTypeFromId: (recordId) => ipcRenderer.invoke('get-object-type-from-id', recordId),
+    onRestProgress: (callback) => ipcRenderer.on('rest-progress', (event, progress) => callback(progress))
 };
 
 // UTC to Local conversion state
 let convertUtcToLocal = false;
 let originalResultData = null;
+let jsonFieldViewMode = 'both';
+let currentRequestId = null;
+let requestStartTime = null;
+let interruptedCombinedRequest = null;
+let currentRequestContext = null;
+let popupRequestTimerInterval = null;
+let toolingModeLicensed = true;
+
+async function refreshToolingModeLicense() {
+    try {
+        const licenseInfo = await window.api.getLicenseInfo();
+        toolingModeLicensed = !!licenseInfo?.licensed;
+    } catch (error) {
+        console.error('Error checking tooling mode license in popup:', error);
+        toolingModeLicensed = false;
+    }
+
+    updateJsonFieldModeVisibility(originalResultData);
+}
 
 // Detect if a string is an ISO 8601 UTC datetime
 function isUtcDateTime(value) {
@@ -121,6 +155,24 @@ function convertToLocalDateTime(utcString) {
     }
 }
 
+function showAlert(message) {
+    const activeElement = document.activeElement;
+    const canRestoreSelection = activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA');
+    const selectionStart = canRestoreSelection ? activeElement.selectionStart : null;
+    const selectionEnd = canRestoreSelection ? activeElement.selectionEnd : null;
+
+    window.alert(message);
+
+    setTimeout(() => {
+        if (activeElement && typeof activeElement.focus === 'function') {
+            activeElement.focus();
+            if (canRestoreSelection && typeof activeElement.setSelectionRange === 'function' && selectionStart !== null && selectionEnd !== null) {
+                activeElement.setSelectionRange(selectionStart, selectionEnd);
+            }
+        }
+    }, 0);
+}
+
 // Recursively convert datetime values in an object or array
 function convertDatetimesInObject(obj) {
     if (obj === null || obj === undefined) return obj;
@@ -145,6 +197,221 @@ function convertDatetimesInObject(obj) {
     }
     
     return obj;
+}
+
+// Remove internal metadata keys (e.g., _apiType, _mergeWarning) from user-facing JSON output
+function sanitizeForJsonOutput(obj) {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        return obj.map(item => sanitizeForJsonOutput(item));
+    }
+
+    if (typeof obj === 'object') {
+        const sanitized = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+            if (key.startsWith('_')) continue;
+            sanitized[key] = sanitizeForJsonOutput(obj[key]);
+        }
+        return sanitized;
+    }
+
+    return obj;
+}
+
+// Add visual markers to tooling-only fields for JSON display (does not affect copied/exported JSON)
+function markToolingFieldsForDisplay(obj, toolingFieldPathSet, basePath = '') {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        return obj.map(item => markToolingFieldsForDisplay(item, toolingFieldPathSet, basePath));
+    }
+
+    if (typeof obj === 'object') {
+        const marked = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+            const path = basePath ? `${basePath}.${key}` : key;
+            const displayKey = toolingFieldPathSet.has(path) ? `⚙️ ${key}` : key;
+            marked[displayKey] = markToolingFieldsForDisplay(obj[key], toolingFieldPathSet, path);
+        }
+        return marked;
+    }
+
+    return obj;
+}
+
+function isRenderableJsonBranch(value) {
+    if (value === undefined) return false;
+    if (value === null) return true;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+}
+
+function filterJsonByToolingMode(obj, toolingFieldPathSet, includeToolingOnly, basePath = '') {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        const filteredArray = obj
+            .map(item => filterJsonByToolingMode(item, toolingFieldPathSet, includeToolingOnly, basePath))
+            .filter(item => isRenderableJsonBranch(item));
+        return filteredArray;
+    }
+
+    if (typeof obj === 'object') {
+        const filteredObject = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+
+            const path = basePath ? `${basePath}.${key}` : key;
+            const isToolingField = toolingFieldPathSet.has(path);
+            const child = filterJsonByToolingMode(obj[key], toolingFieldPathSet, includeToolingOnly, path);
+
+            if (!isRenderableJsonBranch(child)) continue;
+
+            if (includeToolingOnly) {
+                if (isToolingField || (typeof child === 'object' && child !== null)) {
+                    filteredObject[key] = child;
+                }
+            } else if (!isToolingField) {
+                filteredObject[key] = child;
+            }
+        }
+        return filteredObject;
+    }
+
+    const isToolingField = toolingFieldPathSet.has(basePath);
+    if (includeToolingOnly) {
+        return isToolingField ? obj : undefined;
+    }
+    return isToolingField ? undefined : obj;
+}
+
+function mergeApiResultsForDisplay(dataValue, toolingValue) {
+    if (dataValue === undefined) return toolingValue;
+    if (toolingValue === undefined) return dataValue;
+
+    if (Array.isArray(dataValue) && Array.isArray(toolingValue)) {
+        const combined = [...toolingValue, ...dataValue];
+        const seen = new Set();
+        const deduped = [];
+        for (const item of combined) {
+            const key = (item && typeof item === 'object') ? (item.Id || JSON.stringify(item)) : String(item);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            deduped.push(item);
+        }
+        return deduped;
+    }
+
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObject = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (isDataObject && isToolingObject) {
+        const merged = { ...toolingValue, ...dataValue };
+        const keys = new Set([...Object.keys(toolingValue), ...Object.keys(dataValue)]);
+        for (const key of keys) {
+            if (Object.prototype.hasOwnProperty.call(dataValue, key) && Object.prototype.hasOwnProperty.call(toolingValue, key)) {
+                merged[key] = mergeApiResultsForDisplay(dataValue[key], toolingValue[key]);
+            }
+        }
+        return merged;
+    }
+
+    return dataValue;
+}
+
+function collectToolingOnlyFieldPathsForDisplay(dataValue, toolingValue, basePath = '') {
+    const paths = [];
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObject = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (!isToolingObject) return paths;
+    if (!isDataObject) {
+        if (basePath) paths.push(basePath);
+        return paths;
+    }
+
+    for (const key of Object.keys(toolingValue)) {
+        const path = basePath ? `${basePath}.${key}` : key;
+        if (!Object.prototype.hasOwnProperty.call(dataValue, key)) {
+            paths.push(path);
+            continue;
+        }
+        const nestedPaths = collectToolingOnlyFieldPathsForDisplay(dataValue[key], toolingValue[key], path);
+        if (nestedPaths.length > 0) {
+            paths.push(...nestedPaths);
+        }
+    }
+
+    return paths;
+}
+
+function buildMergedResultFromCachedPayloads(sourceObj) {
+    const dataPayload = sourceObj?._dataPayload;
+    const toolingPayload = sourceObj?._toolingPayload;
+    if (!dataPayload || !toolingPayload) return null;
+
+    const merged = mergeApiResultsForDisplay(dataPayload, toolingPayload);
+    merged._toolingFieldPaths = collectToolingOnlyFieldPathsForDisplay(dataPayload, toolingPayload);
+    merged._dataPayload = dataPayload;
+    merged._toolingPayload = toolingPayload;
+    merged._apiType = 'both';
+    return merged;
+}
+
+function buildJsonDisplayData(sourceObj) {
+    const dataPayload = sourceObj?._dataPayload;
+    const toolingPayload = sourceObj?._toolingPayload;
+    const hasDualPayloads = !!dataPayload && !!toolingPayload;
+
+    const baseSource = (jsonFieldViewMode === 'both' && hasDualPayloads)
+        ? (buildMergedResultFromCachedPayloads(sourceObj) || sourceObj)
+        : sourceObj;
+
+    if (jsonFieldViewMode === 'data' && dataPayload && typeof dataPayload === 'object') {
+        return sanitizeForJsonOutput(dataPayload);
+    }
+
+    if (jsonFieldViewMode === 'tooling' && toolingPayload && typeof toolingPayload === 'object') {
+        return sanitizeForJsonOutput(toolingPayload);
+    }
+
+    const sanitized = sanitizeForJsonOutput(baseSource);
+    const toolingFieldPaths = Array.isArray(baseSource?._toolingFieldPaths) ? baseSource._toolingFieldPaths : [];
+    const toolingPathSet = new Set(toolingFieldPaths);
+
+    let filtered = sanitized;
+    if (toolingFieldPaths.length > 0) {
+        if (jsonFieldViewMode === 'data') {
+            filtered = filterJsonByToolingMode(sanitized, toolingPathSet, false);
+        } else if (jsonFieldViewMode === 'tooling') {
+            filtered = filterJsonByToolingMode(sanitized, toolingPathSet, true);
+        }
+    }
+
+    if (jsonFieldViewMode === 'data') {
+        return filtered;
+    }
+
+    const marked = toolingFieldPaths.length > 0
+        ? markToolingFieldsForDisplay(filtered, toolingPathSet)
+        : filtered;
+
+    if (jsonFieldViewMode === 'both' && hasDualPayloads && marked && typeof marked === 'object') {
+        const dataUrl = dataPayload?.attributes?.url;
+        const toolingUrl = toolingPayload?.attributes?.url;
+
+        if (marked.attributes && typeof marked.attributes === 'object' && (dataUrl || toolingUrl)) {
+            const dataPart = dataUrl ? `data=${dataUrl}` : 'data=n/a';
+            const toolingPart = toolingUrl ? `tooling=${toolingUrl}` : 'tooling=n/a';
+            marked.attributes.url = `[both] ${dataPart}; ${toolingPart}`;
+        }
+    }
+
+    return marked;
 }
 
 // Linkify Salesforce IDs in JSON text
@@ -193,7 +460,7 @@ async function handleIdClick(event, idValue) {
             }, 800);
         }).catch(err => {
             console.error('Failed to copy ID:', err);
-            alert('Failed to copy: ' + err.message);
+            showAlert('Failed to copy: ' + err.message);
         });
     } else if (event.altKey) {
         // Alt+click: Open in Salesforce
@@ -215,11 +482,11 @@ async function handleIdClick(event, idValue) {
                 const result = await window.api.executeREST(`${objectType}/${idValue}`);
                 await window.api.openResultWindow(result);
             } else {
-                alert('Cannot determine object type for this ID');
+                showAlert('Cannot determine object type for this ID');
             }
         } catch (error) {
             console.error('Error fetching record:', error);
-            alert('Error fetching record: ' + error.message);
+            showAlert('Error fetching record: ' + error.message);
         }
     }
 }
@@ -234,17 +501,111 @@ function toggleUtcConversion() {
     }
 }
 
+function toggleJsonFieldMode() {
+    const selector = document.getElementById('jsonFieldMode');
+    jsonFieldViewMode = selector ? selector.value : 'both';
+
+    const hasSelectedPayloadCached = (() => {
+        if (!originalResultData) return false;
+
+        if (jsonFieldViewMode === 'both') {
+            return originalResultData._apiType === 'both' || !!buildMergedResultFromCachedPayloads(originalResultData);
+        }
+
+        if (jsonFieldViewMode === 'data') {
+            return originalResultData._apiType === 'data' || originalResultData._apiType === 'both' || !!originalResultData._dataPayload;
+        }
+
+        if (jsonFieldViewMode === 'tooling') {
+            return originalResultData._apiType === 'tooling' || originalResultData._apiType === 'both' || !!originalResultData._toolingPayload;
+        }
+
+        return false;
+    })();
+
+    const isBothApiCandidate = !!originalResultData && originalResultData._apiCandidateBoth === true;
+    if (!interruptedCombinedRequest && isBothApiCandidate && currentRequestContext && !currentRequestId && !hasSelectedPayloadCached) {
+        interruptedCombinedRequest = { ...currentRequestContext };
+    }
+
+    if (jsonFieldViewMode === 'both') {
+        const cachedMergedResult = buildMergedResultFromCachedPayloads(originalResultData);
+        if (cachedMergedResult) {
+            interruptedCombinedRequest = null;
+            originalResultData = cachedMergedResult;
+            renderResult(cachedMergedResult, true);
+            updatePopupTitle(cachedMergedResult);
+            return;
+        }
+    }
+
+    if (interruptedCombinedRequest) {
+        if (jsonFieldViewMode === 'both') {
+            retryInterruptedCombinedRequest();
+            return;
+        }
+
+        if (jsonFieldViewMode === 'data' || jsonFieldViewMode === 'tooling') {
+            const hasPayload = jsonFieldViewMode === 'data'
+                ? (!!originalResultData?._dataPayload || originalResultData?._apiType === 'data' || originalResultData?._apiType === 'both')
+                : (!!originalResultData?._toolingPayload || originalResultData?._apiType === 'tooling' || originalResultData?._apiType === 'both');
+
+            if (!hasPayload) {
+                retryInterruptedSingleSourceRequest(jsonFieldViewMode);
+                return;
+            }
+        }
+    }
+
+    if (originalResultData) {
+        renderResult(originalResultData, true);
+    }
+}
+
+function updateJsonFieldModeVisibility(resultData) {
+    const container = document.getElementById('jsonFieldModeContainer');
+    const selector = document.getElementById('jsonFieldMode');
+    if (!container || !selector) return;
+
+    const hasDualPayloads = !!resultData && !!resultData._dataPayload && !!resultData._toolingPayload;
+    const hasInterruptedCombined = !!resultData && resultData._interruptedBothFetch === true;
+    const isBothApiCandidate = !!resultData && resultData._apiCandidateBoth === true;
+    const canUseToolingModes = toolingModeLicensed === true;
+    const hasToolingToggle =
+        canUseToolingModes &&
+        !!resultData &&
+        !resultData.error &&
+        (hasDualPayloads || hasInterruptedCombined || isBothApiCandidate || (Array.isArray(resultData._toolingFieldPaths) && resultData._toolingFieldPaths.length > 0));
+
+    container.style.display = hasToolingToggle ? 'flex' : 'none';
+
+    if (!hasToolingToggle) {
+        jsonFieldViewMode = 'both';
+        selector.value = 'both';
+    }
+}
+
 // Render result with conversion applied
 function renderResult(resultData, isToggle = false) {
     const contentDiv = document.getElementById('content');
     const copyBtn = document.getElementById('copyBtn');
     const exportBtn = document.getElementById('exportBtn');
+    const selector = document.getElementById('jsonFieldMode');
+
+    if (!isToggle && resultData && (resultData._apiType === 'data' || resultData._apiType === 'tooling' || resultData._apiType === 'both')) {
+        jsonFieldViewMode = resultData._apiType;
+        if (selector) {
+            selector.value = jsonFieldViewMode;
+        }
+    }
     
     // Save current scroll position if toggling
     const savedScrollTop = isToggle ? contentDiv.scrollTop : 0;
+    updateJsonFieldModeVisibility(resultData);
     
     const pre = document.createElement('pre');
-    const displayData = convertUtcToLocal ? convertDatetimesInObject(resultData) : resultData;
+    const outputData = buildJsonDisplayData(resultData);
+    const displayData = convertUtcToLocal ? convertDatetimesInObject(outputData) : outputData;
     const jsonText = JSON.stringify(displayData, null, 2);
     const linkedJson = linkifyIdsInJson(jsonText);
     pre.innerHTML = linkedJson;
@@ -304,7 +665,7 @@ function renderResult(resultData, isToggle = false) {
             }, 2000);
         } catch (err) {
             console.error('Failed to copy:', err);
-            alert('Failed to copy to clipboard');
+            showAlert('Failed to copy to clipboard');
         }
     };
     
@@ -326,6 +687,266 @@ function renderResult(resultData, isToggle = false) {
         a.click();
         URL.revokeObjectURL(url);
     };
+}
+
+function updatePopupTitle(resultData) {
+    const h1 = document.querySelector('h1');
+    const titleBarDragRegion = document.querySelector('.title-bar-drag-region');
+
+    if (resultData && resultData.attributes && resultData.attributes.type) {
+        const recordId = resultData.Id || 'Record';
+        const titleText = `${resultData.attributes.type} - ${recordId}`;
+        document.title = titleText;
+        if (h1) h1.textContent = titleText;
+        if (titleBarDragRegion) titleBarDragRegion.textContent = titleText;
+        return;
+    }
+
+    const fallbackTitle = `REST API Result`;
+    document.title = fallbackTitle;
+    if (h1) h1.textContent = fallbackTitle;
+    if (titleBarDragRegion) titleBarDragRegion.textContent = fallbackTitle;
+}
+
+async function stopPopupRequest() {
+    if (!currentRequestId) return;
+
+    try {
+        await window.api.abortQuery(currentRequestId);
+    } catch (error) {
+        console.error('Error stopping popup request:', error);
+    }
+}
+
+function setProgressCaption(message) {
+    const lineCountInfo = document.getElementById('lineCountInfo');
+    if (!lineCountInfo || !message) return;
+    lineCountInfo.textContent = message;
+}
+
+function setPopupRequestRunning(isRunning) {
+    const stopBtn = document.getElementById('stopRequestBtn');
+    const jsonFieldMode = document.getElementById('jsonFieldMode');
+
+    document.body.style.cursor = isRunning ? 'wait' : 'default';
+    if (stopBtn) {
+        stopBtn.style.display = isRunning ? 'inline-block' : 'none';
+    }
+    if (jsonFieldMode) {
+        jsonFieldMode.disabled = isRunning;
+    }
+}
+
+function handleAbortedCombinedPopupResult(result, requestContext) {
+    if (!result || !(result._apiType === 'data' || result._apiType === 'tooling')) {
+        setProgressCaption('⏹ Request was stopped');
+        return;
+    }
+
+    const selector = document.getElementById('jsonFieldMode');
+    const sourceMode = result._apiType;
+    const payload = sanitizeForJsonOutput(result);
+
+    if (sourceMode === 'data') {
+        result._dataPayload = payload;
+    } else {
+        result._toolingPayload = payload;
+    }
+
+    result._interruptedBothFetch = true;
+    interruptedCombinedRequest = {
+        path: requestContext.path,
+        method: requestContext.method,
+        body: requestContext.body,
+        headers: requestContext.headers,
+        apiMode: requestContext.apiMode || null
+    };
+
+    jsonFieldViewMode = sourceMode;
+    if (selector) selector.value = sourceMode;
+
+    originalResultData = result;
+    renderResult(result);
+    updatePopupTitle(result);
+
+    const elapsedMs = requestStartTime ? Date.now() - requestStartTime : 0;
+    const elapsedSec = (elapsedMs / 1000).toFixed(2);
+    setProgressCaption(`Partial result - ${sourceMode} only (stopped, ${elapsedSec}s).`);
+}
+
+async function retryInterruptedCombinedRequest() {
+    if (!interruptedCombinedRequest || currentRequestId) return;
+    await executePopupRequest(interruptedCombinedRequest);
+}
+
+async function retryInterruptedSingleSourceRequest(sourceMode) {
+    if (!interruptedCombinedRequest || currentRequestId) return;
+
+    const previousMode = sourceMode === 'data' ? 'tooling' : 'data';
+    const selector = document.getElementById('jsonFieldMode');
+    const requestContext = { ...interruptedCombinedRequest };
+    const contentDiv = document.getElementById('content');
+    const existingDataPayload = originalResultData?._dataPayload || (originalResultData?._apiType === 'data' ? sanitizeForJsonOutput(originalResultData) : null);
+    const existingToolingPayload = originalResultData?._toolingPayload || (originalResultData?._apiType === 'tooling' ? sanitizeForJsonOutput(originalResultData) : null);
+
+    const restorePreviousSnap = () => {
+        const hasPreviousPayload = previousMode === 'data'
+            ? !!existingDataPayload
+            : !!existingToolingPayload;
+
+        if (!hasPreviousPayload) return false;
+
+        jsonFieldViewMode = previousMode;
+        if (selector) selector.value = previousMode;
+        renderResult(originalResultData, true);
+
+        const elapsedMs = requestStartTime ? Date.now() - requestStartTime : 0;
+        const elapsedSec = (elapsedMs / 1000).toFixed(2);
+        setProgressCaption(`Partial result - ${previousMode} only (stopped, ${elapsedSec}s).`);
+        return true;
+    };
+
+    setPopupRequestRunning(true);
+    requestStartTime = Date.now();
+    currentRequestId = `popup_${Date.now()}`;
+    setProgressCaption(`Fetching ${sourceMode} response... (0.0s)`);
+    if (popupRequestTimerInterval) {
+        clearInterval(popupRequestTimerInterval);
+        popupRequestTimerInterval = null;
+    }
+    popupRequestTimerInterval = setInterval(() => {
+        const elapsedMs = requestStartTime ? Date.now() - requestStartTime : 0;
+        const elapsedSec = (elapsedMs / 1000).toFixed(1);
+        setProgressCaption(`Fetching ${sourceMode} response... (${elapsedSec}s)`);
+    }, 100);
+
+    try {
+        const singleResult = await window.api.executeREST(
+            requestContext.path,
+            requestContext.method || 'GET',
+            requestContext.body || null,
+            requestContext.headers || null,
+            currentRequestId,
+            sourceMode
+        );
+
+        if (singleResult && singleResult.aborted) {
+            if (!restorePreviousSnap()) {
+                handleAbortedCombinedPopupResult(singleResult, requestContext);
+            }
+            return;
+        }
+
+        const payload = sanitizeForJsonOutput(singleResult);
+        const nextResult = {
+            ...(originalResultData && typeof originalResultData === 'object' ? originalResultData : {}),
+            _interruptedBothFetch: true,
+            _apiType: sourceMode,
+            _dataPayload: sourceMode === 'data' ? payload : existingDataPayload,
+            _toolingPayload: sourceMode === 'tooling' ? payload : existingToolingPayload
+        };
+
+        if (sourceMode === 'tooling' && !nextResult._dataPayload) {
+            delete nextResult._dataPayload;
+        }
+        if (sourceMode === 'data' && !nextResult._toolingPayload) {
+            delete nextResult._toolingPayload;
+        }
+
+        jsonFieldViewMode = sourceMode;
+        if (selector) selector.value = sourceMode;
+        originalResultData = nextResult;
+        renderResult(nextResult);
+        updatePopupTitle(nextResult);
+    } catch (err) {
+        const isAbortError = err && (err.name === 'AbortError' || (typeof err.message === 'string' && (err.message.includes('aborted') || err.message.includes('AbortError'))));
+        if (isAbortError && restorePreviousSnap()) {
+            return;
+        }
+        showAlert('Error loading data: ' + (err.message || 'Unknown error'));
+    } finally {
+        if (popupRequestTimerInterval) {
+            clearInterval(popupRequestTimerInterval);
+            popupRequestTimerInterval = null;
+        }
+        currentRequestId = null;
+        setPopupRequestRunning(false);
+    }
+}
+
+if (window.api?.onRestProgress) {
+    window.api.onRestProgress((progress) => {
+        if (!progress || !currentRequestId || progress.requestId !== currentRequestId) return;
+
+        if (progress.phase === 'partial' && progress.result) {
+            originalResultData = progress.result;
+            renderResult(progress.result);
+            updatePopupTitle(progress.result);
+            document.getElementById('buttonGroup').style.display = 'inline';
+
+            const elapsedMs = requestStartTime ? Date.now() - requestStartTime : 0;
+            const elapsedSec = (elapsedMs / 1000).toFixed(2);
+            const waitingFor = Array.isArray(progress.pending) && progress.pending.length > 0
+                ? progress.pending.join(' + ')
+                : 'remaining API';
+            setProgressCaption(`Partial result - ${progress.source} only, waiting for ${waitingFor}... (${elapsedSec}s)`);
+        }
+    });
+}
+
+async function executePopupRequest(request) {
+    const contentDiv = document.getElementById('content');
+    const selector = document.getElementById('jsonFieldMode');
+
+    try {
+        const requestedApiMode = (request && (request.apiMode === 'both' || request.apiMode === 'data' || request.apiMode === 'tooling'))
+            ? request.apiMode
+            : null;
+
+        if (requestedApiMode && selector) {
+            jsonFieldViewMode = requestedApiMode;
+            selector.value = requestedApiMode;
+        }
+
+        currentRequestContext = {
+            path: request.path,
+            method: request.method || 'GET',
+            body: request.body || null,
+            headers: request.headers || null,
+            apiMode: requestedApiMode
+        };
+        currentRequestId = request?.requestId || `popup_${Date.now()}`;
+        requestStartTime = Date.now();
+        setPopupRequestRunning(true);
+
+        contentDiv.innerHTML = '<div class="loading">⏳ Loading...</div>';
+        const resultData = await window.api.executeREST(
+            currentRequestContext.path,
+            currentRequestContext.method,
+            currentRequestContext.body,
+            currentRequestContext.headers,
+            currentRequestId,
+            currentRequestContext.apiMode
+        );
+
+        if (resultData && resultData.aborted) {
+            handleAbortedCombinedPopupResult(resultData, currentRequestContext);
+            return;
+        }
+
+        originalResultData = resultData;
+        interruptedCombinedRequest = null;
+        renderResult(resultData);
+        updatePopupTitle(resultData);
+        document.getElementById('buttonGroup').style.display = 'inline';
+    } catch (err) {
+        updateJsonFieldModeVisibility(null);
+        updatePopupTitle(null);
+        contentDiv.innerHTML = `<div class="error">${err.message || 'Error loading data'}</div>`;
+    } finally {
+        currentRequestId = null;
+        setPopupRequestRunning(false);
+    }
 }
 
 // Search functionality
@@ -529,6 +1150,9 @@ document.addEventListener('keydown', (e) => {
         if (searchBox && searchBox.style.display === 'block') {
             // If search is open, close it first
             closeSearch();
+        } else if (currentRequestId) {
+            // If a request is running, stop it first
+            stopPopupRequest();
         } else {
             // If search is closed, close the window
             window.close();
@@ -537,13 +1161,15 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Request the result data from main process
-ipcRenderer.invoke('get-result-data').then(resultWrapper => {
+ipcRenderer.invoke('get-result-data').then(async resultWrapper => {
     const contentDiv = document.getElementById('content');
     const openInSFBtn = document.getElementById('openInSF');
     const buttonGroup = document.getElementById('buttonGroup');
     const copyBtn = document.getElementById('copyBtn');
     const exportBtn = document.getElementById('exportBtn');
     const checkbox = document.getElementById('convertUtcCheckbox');
+
+    await refreshToolingModeLicense();
     
     if (!resultWrapper) {
         contentDiv.innerHTML = '<div class="error">No data available</div>';
@@ -551,19 +1177,27 @@ ipcRenderer.invoke('get-result-data').then(resultWrapper => {
     }
     
     // Extract data and conversion state
-    const resultData = resultWrapper.data || resultWrapper;
+    const request = resultWrapper.request || null;
+    const resultData = resultWrapper.data || (request ? null : resultWrapper);
     const inheritedConversion = resultWrapper.convertUtcToLocal || false;
     
     // Set checkbox state to match main window
     convertUtcToLocal = inheritedConversion;
     checkbox.checked = convertUtcToLocal;
     
+    if (request) {
+        executePopupRequest(request);
+        return;
+    }
+
     if (!resultData) {
         contentDiv.innerHTML = '<div class="error">No data available</div>';
         return;
     }
     
     if (resultData.error) {
+        updateJsonFieldModeVisibility(null);
+        updatePopupTitle(null);
         contentDiv.innerHTML = `<div class="error">${resultData.error}</div>`;
     } else {
         // Store original data
@@ -571,26 +1205,19 @@ ipcRenderer.invoke('get-result-data').then(resultWrapper => {
         
         // Render with current conversion setting
         renderResult(resultData);
+        updatePopupTitle(resultData);
         
         // Show buttons
         buttonGroup.style.display = 'inline';
         
-        // Update title with object type if available
+        // Keep line count label in sync with rendered JSON
         if (resultData.attributes && resultData.attributes.type) {
-            const recordId = resultData.Id || 'Record';
-            const titleText = `${resultData.attributes.type} - ${recordId}`;
-            document.title = titleText;
             // Get line count from rendered JSON
             const pre = document.querySelector('#content pre');
             const lineCount = pre ? pre.textContent.split('\n').length : 0;
-            document.querySelector('h1').textContent = `${resultData.attributes.type} - ${recordId}`;
             const lineCountInfo = document.getElementById('lineCountInfo');
             if (lineCountInfo) {
                 lineCountInfo.textContent = `${lineCount} lines`;
-            }
-            const titleBarDragRegion = document.querySelector('.title-bar-drag-region');
-            if (titleBarDragRegion) {
-                titleBarDragRegion.textContent = titleText;
             }
         }
         
@@ -604,11 +1231,11 @@ ipcRenderer.invoke('get-result-data').then(resultWrapper => {
                         const url = `${config.instanceUrl}/${resultData.Id}`;
                         await ipcRenderer.invoke('open-external', url);
                     } else {
-                        alert('Cannot determine Salesforce URL');
+                        showAlert('Cannot determine Salesforce URL');
                     }
                 } catch (err) {
                     console.error('Error opening Salesforce URL:', err);
-                    alert('Failed to open Salesforce URL');
+                    showAlert('Failed to open Salesforce URL');
                 }
             });
         }

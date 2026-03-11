@@ -504,6 +504,105 @@ function shouldUseToolingAPI(queryOrPath) {
     return isToolingObject(objectName);
 }
 
+// Recursively merge API responses, preferring Data API scalar values on conflicts
+function mergeApiResults(dataValue, toolingValue) {
+    if (dataValue === undefined) return toolingValue;
+    if (toolingValue === undefined) return dataValue;
+
+    if (Array.isArray(dataValue) && Array.isArray(toolingValue)) {
+        const combined = [...toolingValue, ...dataValue];
+        const seen = new Set();
+        return combined.filter(item => {
+            const key = (item && typeof item === 'object') ? JSON.stringify(item) : String(item);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObjectValue = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (isDataObject && isToolingObjectValue) {
+        const merged = { ...toolingValue, ...dataValue };
+        const keys = new Set([...Object.keys(toolingValue), ...Object.keys(dataValue)]);
+        for (const key of keys) {
+            if (Object.prototype.hasOwnProperty.call(dataValue, key) && Object.prototype.hasOwnProperty.call(toolingValue, key)) {
+                merged[key] = mergeApiResults(dataValue[key], toolingValue[key]);
+            }
+        }
+        return merged;
+    }
+
+    // Prefer Data API values for scalar conflicts
+    return dataValue;
+}
+
+// Collect field paths that exist in Tooling API response but not in Data API response
+function collectToolingOnlyFieldPaths(dataValue, toolingValue, basePath = '') {
+    const paths = [];
+
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObjectValue = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (!isToolingObjectValue) {
+        return paths;
+    }
+
+    if (!isDataObject) {
+        return paths;
+    }
+
+    for (const key of Object.keys(toolingValue)) {
+        const path = basePath ? `${basePath}.${key}` : key;
+        const hasInData = Object.prototype.hasOwnProperty.call(dataValue, key);
+
+        if (!hasInData) {
+            paths.push(path);
+            continue;
+        }
+
+        const nestedPaths = collectToolingOnlyFieldPaths(dataValue[key], toolingValue[key], path);
+        if (nestedPaths.length > 0) {
+            paths.push(...nestedPaths);
+        }
+    }
+
+    return paths;
+}
+
+async function getObjectApiAvailability(objectName) {
+    if (!objectName || !currentConfigFile) {
+        return { inData: false, inTooling: false, inBoth: false };
+    }
+
+    let toolingObjectsList = toolingObjectsCache[currentConfigFile];
+    let dataObjectsList = dataObjectsCache[currentConfigFile];
+
+    if (!toolingObjectsList || !Array.isArray(toolingObjectsList) || toolingObjectsList.length === 0) {
+        toolingObjectsList = await fetchToolingObjects();
+    }
+
+    if (!dataObjectsList || !Array.isArray(dataObjectsList) || dataObjectsList.length === 0) {
+        const globalResult = await describeGlobal();
+        dataObjectsList = globalResult?.sobjects || [];
+    }
+
+    const lowerName = objectName.toLowerCase();
+    const inTooling = Array.isArray(toolingObjectsList) && toolingObjectsList.some(obj =>
+        obj && obj.name && obj.name.toLowerCase() === lowerName
+    );
+    const inData = Array.isArray(dataObjectsList) && dataObjectsList.some(obj =>
+        obj && obj.name && obj.name.toLowerCase() === lowerName
+    );
+
+    return {
+        inData,
+        inTooling,
+        inBoth: inData && inTooling
+    };
+}
+
 // Expand SELECT * to actual field names
 async function expandSelectStar(query) {
     // Check if query contains SELECT *
@@ -690,7 +789,7 @@ function checkLicense() {
     }
     
     if (!licenseKey) {
-        return { licensed: false, message: 'No license key configured' };
+        return { licensed: false, message: 'No license key configured.' };
     }
     
     try {
@@ -784,18 +883,37 @@ CQIDAQAB
     }
 }
 
-async function executeREST(path, method = 'GET', body = null, headers = null) {
+async function executeREST(path, method = 'GET', body = null, headers = null, onProgress = null, abortSignal = null, apiMode = null) {
     const config = loadConfig();
     const apiVersion = await getApiVersion();
-    
-    // Detect if this path uses Tooling API objects
-    const useTooling = shouldUseToolingAPI(path);
+    const normalizedMethod = (method || 'GET').toUpperCase();
+    const objectName = extractObjectNameFromInput(path);
+    const availability = await getObjectApiAvailability(objectName);
+    const isDataOnlyWriteMethod = normalizedMethod === 'PUT' || normalizedMethod === 'PATCH' || normalizedMethod === 'DELETE';
+    const isBothApiCandidate = normalizedMethod === 'GET' && availability.inBoth;
+
+    if (isDataOnlyWriteMethod && !availability.inData) {
+        throw new Error(`${normalizedMethod} is only supported on Data API objects. ${objectName || 'This object'} is not available in Data API.`);
+    }
+
+    let useBothApis = availability.inBoth && !isDataOnlyWriteMethod;
+    let useTooling = availability.inTooling && !availability.inData && !isDataOnlyWriteMethod;
+
+    if (!isDataOnlyWriteMethod && normalizedMethod === 'GET') {
+        if (apiMode === 'data' && availability.inData) {
+            useBothApis = false;
+            useTooling = false;
+        } else if (apiMode === 'tooling' && availability.inTooling) {
+            useBothApis = false;
+            useTooling = true;
+        }
+    }
     
     // Check license for write operations or Tooling API
-    if (method !== 'GET' || useTooling) {
+    if (normalizedMethod !== 'GET' || useTooling || useBothApis) {
         const licenseStatus = checkLicense();
         if (!licenseStatus.licensed) {
-            const reason = useTooling ? 'Tooling API access' : 'write operations';
+            const reason = useBothApis ? 'merged Data + Tooling API access' : (useTooling ? 'Tooling API access' : 'write operations');
             throw new Error(`License required for ${reason}. ${licenseStatus.message} Copy .env.example to .env, then visit https://getplayforce.com to get a free license and paste it in.`);
         }
     }
@@ -805,49 +923,157 @@ async function executeREST(path, method = 'GET', body = null, headers = null) {
             ({ token, instanceUrl } = await getAccessToken());
         }
 
-        // Use /services/data/v##.0/tooling/sobjects or /services/data/v##.0/sobjects
-        const toolingPath = useTooling ? '/tooling' : '';
-        const url = `${instanceUrl}/services/data/${apiVersion}${toolingPath}/sobjects/${path}`;
-        console.log(`Making ${method} ${useTooling ? 'Tooling API' : 'Data API'} REST request to:`, url);
-        if (headers) {
-            console.log('Custom headers:', JSON.stringify(headers));
-        }
-        if (body) {
-            console.log('Request body:', JSON.stringify(body));
-        }
-
-        const fetchOptions = {
-            method: method,
-            headers: {
-                "Authorization": `Bearer ${token}`,
-                "Content-Type": "application/json",
-                ...(headers || {}) // Merge custom headers
+        const callRestApi = async (toolingEnabled) => {
+            const toolingPath = toolingEnabled ? '/tooling' : '';
+            const url = `${instanceUrl}/services/data/${apiVersion}${toolingPath}/sobjects/${path}`;
+            console.log(`Making ${normalizedMethod} ${toolingEnabled ? 'Tooling API' : 'Data API'} REST request to:`, url);
+            if (headers) {
+                console.log('Custom headers:', JSON.stringify(headers));
             }
+            if (body) {
+                console.log('Request body:', JSON.stringify(body));
+            }
+
+            const fetchOptions = {
+                method: normalizedMethod,
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                    ...(headers || {})
+                }
+            };
+
+            if (abortSignal) {
+                fetchOptions.signal = abortSignal;
+            }
+
+            if (body && (normalizedMethod === 'POST' || normalizedMethod === 'PATCH' || normalizedMethod === 'PUT')) {
+                fetchOptions.body = JSON.stringify(body);
+            }
+
+            const res = await fetch(url, fetchOptions);
+
+            if (!res.ok) {
+                const text = await res.text();
+                throw new Error(`REST API error: ${text}\nURL: ${url}`);
+            }
+
+            const contentType = res.headers.get('content-type');
+            if (contentType && contentType.includes('application/json')) {
+                return await res.json();
+            }
+
+            return { success: true, status: res.status };
         };
 
-        if (body && (method === 'POST' || method === 'PATCH' || method === 'PUT')) {
-            fetchOptions.body = JSON.stringify(body);
+        if (useBothApis) {
+            const emitProgress = (payload) => {
+                if (typeof onProgress === 'function') {
+                    try {
+                        onProgress(payload);
+                    } catch (progressError) {
+                        console.warn('REST progress callback error:', progressError?.message || progressError);
+                    }
+                }
+            };
+
+            const dataPromise = callRestApi(false)
+                .then((value) => {
+                    emitProgress({
+                        phase: 'partial',
+                        source: 'data',
+                        pending: ['tooling'],
+                        result: {
+                            ...value,
+                            _apiType: 'data'
+                        }
+                    });
+                    return value;
+                })
+                .catch((error) => {
+                    emitProgress({
+                        phase: 'partial-error',
+                        source: 'data',
+                        pending: ['tooling'],
+                        error: error?.message || String(error)
+                    });
+                    throw error;
+                });
+
+            const toolingPromise = callRestApi(true)
+                .then((value) => {
+                    emitProgress({
+                        phase: 'partial',
+                        source: 'tooling',
+                        pending: ['data'],
+                        result: {
+                            ...value,
+                            _apiType: 'tooling'
+                        }
+                    });
+                    return value;
+                })
+                .catch((error) => {
+                    emitProgress({
+                        phase: 'partial-error',
+                        source: 'tooling',
+                        pending: ['data'],
+                        error: error?.message || String(error)
+                    });
+                    throw error;
+                });
+
+            const [dataResultSettled, toolingResultSettled] = await Promise.allSettled([
+                dataPromise,
+                toolingPromise
+            ]);
+
+            if (dataResultSettled.status === 'rejected' && toolingResultSettled.status === 'rejected') {
+                throw new Error(`REST API error (both failed):\nData: ${dataResultSettled.reason?.message || dataResultSettled.reason}\nTooling: ${toolingResultSettled.reason?.message || toolingResultSettled.reason}`);
+            }
+
+            if (dataResultSettled.status === 'fulfilled' && toolingResultSettled.status === 'fulfilled') {
+                const merged = mergeApiResults(dataResultSettled.value, toolingResultSettled.value);
+                merged._toolingFieldPaths = collectToolingOnlyFieldPaths(dataResultSettled.value, toolingResultSettled.value);
+                merged._dataPayload = dataResultSettled.value;
+                merged._toolingPayload = toolingResultSettled.value;
+                merged._apiType = 'both';
+                merged._apiCandidateBoth = isBothApiCandidate;
+                return merged;
+            }
+
+            // Partial success fallback (still provide successful response)
+            const successfulResult = dataResultSettled.status === 'fulfilled'
+                ? { ...dataResultSettled.value, _apiType: 'data' }
+                : { ...toolingResultSettled.value, _apiType: 'tooling' };
+
+            const dataError = dataResultSettled.status === 'rejected' ? dataResultSettled.reason : null;
+            const toolingError = toolingResultSettled.status === 'rejected' ? toolingResultSettled.reason : null;
+            const isAbortError = (error) =>
+                !!error && (
+                    error.name === 'AbortError' ||
+                    (typeof error.message === 'string' && (error.message.includes('aborted') || error.message.includes('AbortError')))
+                );
+
+            successfulResult._mergeWarning = dataResultSettled.status === 'rejected'
+                ? `Data API failed: ${dataError?.message || dataError}`
+                : `Tooling API failed: ${toolingError?.message || toolingError}`;
+            successfulResult._apiCandidateBoth = isBothApiCandidate;
+
+            if (isAbortError(dataError) || isAbortError(toolingError)) {
+                successfulResult.aborted = true;
+                successfulResult._abortedPending = [
+                    isAbortError(dataError) ? 'data' : null,
+                    isAbortError(toolingError) ? 'tooling' : null
+                ].filter(Boolean);
+            }
+
+            return successfulResult;
         }
 
-        const res = await fetch(url, fetchOptions);
-
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`REST API error: ${text}\nURL: ${url}`);
-        }
-
-        // For DELETE or some operations, response might be empty
-        const contentType = res.headers.get('content-type');
-        let resultData;
-        if (contentType && contentType.includes('application/json')) {
-            resultData = await res.json();
-        } else {
-            // For 204 No Content or other non-JSON responses
-            resultData = { success: true, status: res.status };
-        }
-        
-        // Add metadata about which API was used
+        const resultData = await callRestApi(useTooling);
         resultData._apiType = useTooling ? 'tooling' : 'data';
+        resultData._apiCandidateBoth = isBothApiCandidate;
         return resultData;
     });
 }
@@ -997,30 +1223,44 @@ async function fetchIdPrefixes() {
     }
     
     try {
-        let sobjects;
-        
+        let dataSObjects;
+        let toolingSObjects = [];
+
         // First check if dataObjectsCache already has the sobjects (from fetchSObjects)
         if (dataObjectsCache[currentConfigFile] && dataObjectsCache[currentConfigFile].length > 0) {
             console.log('Using sobjects from dataObjectsCache for ID prefixes');
-            sobjects = dataObjectsCache[currentConfigFile];
+            dataSObjects = dataObjectsCache[currentConfigFile];
         } else {
             // Fetch describe global to get all objects with their key prefixes
             // This will also populate dataObjectsCache automatically
             const describeResult = await describeGlobal();
-            
+
             if (!describeResult || !describeResult.sobjects) {
                 console.warn('No sobjects returned from describeGlobal');
                 return {};
             }
-            
-            sobjects = describeResult.sobjects;
+
+            dataSObjects = describeResult.sobjects;
         }
-        
+
+        // Fetch tooling objects as well to resolve tooling-only ID prefixes (best effort)
+        const toolingResult = await fetchToolingObjects();
+        if (Array.isArray(toolingResult)) {
+            toolingSObjects = toolingResult;
+        }
+
         const prefixMap = {};
-        
-        // Build prefix -> object type mapping
-        for (const sobject of sobjects) {
-            if (sobject.keyPrefix) {
+
+        // Build prefix -> object type mapping from Tooling first
+        for (const sobject of toolingSObjects) {
+            if (sobject && sobject.keyPrefix && sobject.name) {
+                prefixMap[sobject.keyPrefix] = sobject.name;
+            }
+        }
+
+        // Then overlay Data API mappings (prefer Data on conflicts)
+        for (const sobject of dataSObjects) {
+            if (sobject && sobject.keyPrefix && sobject.name) {
                 prefixMap[sobject.keyPrefix] = sobject.name;
             }
         }

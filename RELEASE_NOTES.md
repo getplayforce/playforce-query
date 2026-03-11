@@ -1,4 +1,13 @@
 
+## v0.3.4
+### March, 2026
+- Added merged Data + Tooling REST support for objects available in both APIs (License Required)
+- Enforced Data API-only writes for PUT/PATCH/DELETE operations
+- Updated API icons: 🔩 for Data + Tooling and ⚙️ for Tooling-only
+- Added a JSON field mode toggle: Data + Tooling, Data Only, and Tooling Only
+- Expanded ID prefix resolution to include Tooling prefixes
+- Replaced blocking main-window alerts with in-app alerts to keep editor focus
+
 ## v0.3.3
 ### February, 2026
 - Automatic API version detection - dynamically fetches available versions from Salesforce, using second-to-latest for stability

@@ -10,7 +10,7 @@ try {
 
     window.api = {
         executeSOQL: (query, queryId) => ipcRenderer.invoke('execute-soql', query, queryId),
-        executeREST: (path, method = 'GET', body = null, headers = null) => ipcRenderer.invoke('execute-rest', path, method, body, headers),
+        executeREST: (path, method = 'GET', body = null, headers = null, requestId = null, apiMode = null) => ipcRenderer.invoke('execute-rest', path, method, body, headers, requestId, apiMode),
         abortQuery: (queryId) => ipcRenderer.invoke('abort-query', queryId),
         setConfigFile: (configName) => ipcRenderer.invoke('set-config-file', configName),
         listConfigs: () => ipcRenderer.invoke('list-configs'),
@@ -23,6 +23,7 @@ try {
         onOAuthCallback: (callback) => ipcRenderer.on('oauth-callback', (event, code) => callback(code)),
         onOAuthError: (callback) => ipcRenderer.on('oauth-error', (event, error) => callback(error)),
         onSOQLProgress: (callback) => ipcRenderer.on('soql-progress', (event, progress) => callback(progress)),
+        onRestProgress: (callback) => ipcRenderer.on('rest-progress', (event, progress) => callback(progress)),
         describeGlobal: () => ipcRenderer.invoke('describe-global'),
         describeObject: (objectName) => ipcRenderer.invoke('describe-object', objectName),
         fetchToolingObjects: () => ipcRenderer.invoke('fetch-tooling-objects'),
@@ -88,6 +89,9 @@ tr:hover { background:#fffae6; }
 #exportJsonBtn, #exportCsvBtn { padding:4px 8px; font-size:12px; cursor:pointer; }
 #clearFiltersBtn { padding:4px 8px; font-size:12px; cursor:pointer; background:#6c757d; color:white; border:none; border-radius:4px; display:none; }
 #clearFiltersBtn:hover { background:#5a6268; }
+
+#defaultModeFooter { display:flex; align-items:center; justify-content:flex-start; gap:8px; padding:6px 10px; border-top:1px solid #ccc; background:#f5f5f5; font-size:12px; flex-shrink:0; }
+#defaultJsonRequestMode { font-size:12px; padding:2px 4px; }
 
 .search-box { position:absolute; top:10px; right:10px; background:#fff; border:2px solid #0066cc; border-radius:4px; padding:8px; box-shadow:0 2px 8px rgba(0,0,0,0.2); z-index:1000; display:none; }
 .search-box input { border:1px solid #ccc; padding:4px; margin-right:4px; font-size:12px; width:250px; }
@@ -187,12 +191,21 @@ tr:hover { background:#fffae6; }
 <div id="splitter"></div>
 <div id="bottom" style="background:#fff; display:flex; flex-direction:column; position:relative;">
     <div id="results-header">
-        <span id="resultsCount" style="font-size:14px; font-family:monospace; color:#666; margin-right:auto;"></span>
+        <div style="display:flex; align-items:center; gap:8px; margin-right:auto;">
+            <span id="resultsCount" style="font-size:14px; font-family:monospace; color:#666;"></span>
+            <label id="jsonFieldModeContainer" style="display:none; align-items:center; gap:4px; font-size:12px;" title="Choose which fields to show in JSON view">
+                <select id="jsonFieldMode" onchange="toggleJsonFieldMode()" style="font-size:12px; padding:2px 4px;">
+                    <option value="data">Data Only</option>
+                    <option value="tooling">Tooling Only</option>
+                    <option value="both" selected>Data + Tooling</option>
+                </select>
+            </label>
+        </div>
         <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; margin-right:8px;" title="Convert UTC datetime to local timezone">
             <input type="checkbox" id="convertUtcCheckbox" onchange="toggleUtcConversion()" style="cursor:pointer;">
             <span>Local Time</span>
         </label>
-        <button id="stopQueryBtn" onclick="stopQuery()">⏹ Stop Query</button>
+        <button id="stopQueryBtn" onclick="stopQuery()">⏹ Stop (Esc)</button>
         <span id="buttonGroup" style="display:none;">
             <button id="copyJsonBtn" tabindex="-1">Copy JSON</button>
             <button id="copyTableBtn" tabindex="-1">Copy Table</button>
@@ -211,6 +224,14 @@ tr:hover { background:#fffae6; }
         <button onclick="closeSearch('log')" title="Close (Escape)">✕</button>
     </div>
 </div>
+<div id="defaultModeFooter">
+    <span>JSON Response Default:</span>
+    <select id="defaultJsonRequestMode" onchange="setDefaultJsonRequestMode()" title="Initial API mode for new REST requests and popups">
+        <option value="data" selected>Data Only</option>
+        <option value="tooling">Tooling Only</option>
+        <option value="both">Data + Tooling</option>
+    </select>
+</div>
 
 <script>
 // Global variable to store the actual OAuth redirect URI
@@ -218,6 +239,8 @@ let currentRedirectUri = null;
 
 // Autocomplete state
 let sobjectsCache = null; // Cached list of SObjects
+let dataSObjectsCache = null; // Cached Data API SObjects
+let toolingSObjectsCache = null; // Cached Tooling API SObjects
 let objectFieldsCache = {}; // Cached field metadata per object: { objectName: fieldsArray }
 
 
@@ -235,6 +258,33 @@ let filtersVisible = false;
 // UTC to Local conversion state
 let convertUtcToLocal = false;
 let originalElapsedTime = null;
+let jsonFieldViewMode = 'both';
+let interruptedCombinedRequest = null;
+let currentRestRequestContext = null;
+let defaultJsonRequestMode = 'data';
+let toolingModeLicensed = true;
+
+function getDefaultJsonRequestMode() {
+    const selector = document.getElementById('defaultJsonRequestMode');
+    const mode = selector ? selector.value : defaultJsonRequestMode;
+    return (mode === 'data' || mode === 'tooling' || mode === 'both') ? mode : 'both';
+}
+
+function setDefaultJsonRequestMode() {
+    defaultJsonRequestMode = getDefaultJsonRequestMode();
+}
+
+async function refreshToolingModeLicense() {
+    try {
+        const licenseInfo = await window.api.getLicenseInfo();
+        toolingModeLicensed = !!licenseInfo?.licensed;
+    } catch (error) {
+        console.error('Error checking tooling mode license:', error);
+        toolingModeLicensed = false;
+    }
+
+    updateJsonFieldModeVisibility(currentResultData);
+}
 
 // Detect if a string is an ISO 8601 UTC datetime
 function isUtcDateTime(value) {
@@ -276,6 +326,82 @@ function convertToLocalDateTime(utcString) {
     }
 }
 
+function showAlert(message) {
+    let alertBox = document.getElementById('appAlertBox');
+    let alertText = document.getElementById('appAlertText');
+    const closeAlert = () => {
+        alertBox.style.display = 'none';
+        if (window.__appAlertHideTimer) {
+            clearTimeout(window.__appAlertHideTimer);
+            window.__appAlertHideTimer = null;
+        }
+        if (typeof editorView !== 'undefined' && editorView && typeof editorView.focus === 'function') {
+            editorView.focus();
+        }
+    };
+
+    if (!alertBox) {
+        alertBox = document.createElement('div');
+        alertBox.id = 'appAlertBox';
+        alertBox.style.position = 'fixed';
+        alertBox.style.left = '50%';
+        alertBox.style.top = '50%';
+        alertBox.style.transform = 'translate(-50%, -50%)';
+        alertBox.style.display = 'none';
+        alertBox.style.alignItems = 'center';
+        alertBox.style.gap = '8px';
+        alertBox.style.maxWidth = '60vw';
+        alertBox.style.minWidth = '280px';
+        alertBox.style.padding = '8px 12px';
+        alertBox.style.border = '2px solid #0066cc';
+        alertBox.style.borderRadius = '6px';
+        alertBox.style.background = '#fff';
+        alertBox.style.color = '#333';
+        alertBox.style.boxShadow = '0 4px 10px rgba(0,0,0,0.15)';
+        alertBox.style.fontFamily = 'sans-serif';
+        alertBox.style.fontSize = '12px';
+        alertBox.style.zIndex = '20000';
+
+        alertText = document.createElement('span');
+        alertText.id = 'appAlertText';
+        alertText.style.whiteSpace = 'pre-wrap';
+        alertBox.appendChild(alertText);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = 'OK';
+        closeBtn.style.border = 'none';
+        closeBtn.style.background = '#0066cc';
+        closeBtn.style.color = 'white';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.style.fontSize = '12px';
+        closeBtn.style.padding = '4px 10px';
+        closeBtn.style.borderRadius = '4px';
+        closeBtn.addEventListener('click', closeAlert);
+        alertBox.appendChild(closeBtn);
+
+        document.body.appendChild(alertBox);
+    }
+
+    alertText.textContent = message;
+    alertBox.style.display = 'flex';
+
+    if (window.__appAlertHideTimer) {
+        clearTimeout(window.__appAlertHideTimer);
+    }
+    window.__appAlertHideTimer = setTimeout(() => {
+        const box = document.getElementById('appAlertBox');
+        if (box) {
+            closeAlert();
+        }
+    }, 4500);
+
+    setTimeout(() => {
+        if (typeof editorView !== 'undefined' && editorView && typeof editorView.focus === 'function') {
+            editorView.focus();
+        }
+    }, 0);
+}
+
 // Toggle UTC to local datetime conversion
 function toggleUtcConversion() {
     const checkbox = document.getElementById('convertUtcCheckbox');
@@ -311,6 +437,280 @@ function toggleUtcConversion() {
     }
 }
 
+// Toggle JSON field display mode (Both, Data-only, Tooling-only)
+function toggleJsonFieldMode() {
+    const selector = document.getElementById('jsonFieldMode');
+    jsonFieldViewMode = selector ? selector.value : 'both';
+
+    const hasSelectedPayloadCached = (() => {
+        if (!currentResultData) return false;
+
+        if (jsonFieldViewMode === 'both') {
+            return currentResultData._apiType === 'both' || !!buildMergedResultFromCachedPayloads(currentResultData);
+        }
+
+        if (jsonFieldViewMode === 'data') {
+            return currentResultData._apiType === 'data' || currentResultData._apiType === 'both' || !!currentResultData._dataPayload;
+        }
+
+        if (jsonFieldViewMode === 'tooling') {
+            return currentResultData._apiType === 'tooling' || currentResultData._apiType === 'both' || !!currentResultData._toolingPayload;
+        }
+
+        return false;
+    })();
+
+    const isBothApiCandidate = !!currentResultData && currentResultData._apiCandidateBoth === true;
+    if (!interruptedCombinedRequest && isBothApiCandidate && currentRestRequestContext && !currentQueryId && !hasSelectedPayloadCached) {
+        interruptedCombinedRequest = { ...currentRestRequestContext };
+    }
+
+    if (interruptedCombinedRequest) {
+        if (jsonFieldViewMode === 'both') {
+            const cachedMergedResult = buildMergedResultFromCachedPayloads(currentResultData);
+            if (cachedMergedResult) {
+                interruptedCombinedRequest = null;
+                renderResult(cachedMergedResult, true);
+                return;
+            }
+
+            retryInterruptedCombinedRequest();
+            return;
+        }
+
+        if (jsonFieldViewMode === 'data' || jsonFieldViewMode === 'tooling') {
+            const hasPayload = jsonFieldViewMode === 'data'
+                ? (!!currentResultData?._dataPayload || currentResultData?._apiType === 'data' || currentResultData?._apiType === 'both')
+                : (!!currentResultData?._toolingPayload || currentResultData?._apiType === 'tooling' || currentResultData?._apiType === 'both');
+
+            if (!hasPayload) {
+                retryInterruptedSingleSourceRequest(jsonFieldViewMode);
+                return;
+            }
+        }
+    }
+
+    if (!currentResultData) return;
+
+    // Only re-render immediately for JSON/pre views (not tabular record sets)
+    if (!currentResultData.records && !Array.isArray(currentResultData)) {
+        logContent.innerHTML = '';
+        currentTable = null;
+        currentTbody = null;
+        renderResult(currentResultData, true);
+    }
+}
+
+function updateJsonFieldModeVisibility(result) {
+    const container = document.getElementById('jsonFieldModeContainer');
+    const selector = document.getElementById('jsonFieldMode');
+    if (!container || !selector) return;
+
+    const hasDualPayloads = !!result && !!result._dataPayload && !!result._toolingPayload;
+    const hasInterruptedCombined = !!result && result._interruptedBothFetch === true;
+    const isBothApiCandidate = !!result && result._apiCandidateBoth === true;
+    const canUseToolingModes = toolingModeLicensed === true;
+    const hasToolingToggle =
+        canUseToolingModes &&
+        !!result &&
+        !result.records &&
+        !Array.isArray(result) &&
+        (hasDualPayloads || hasInterruptedCombined || isBothApiCandidate || (Array.isArray(result._toolingFieldPaths) && result._toolingFieldPaths.length > 0));
+
+    container.style.display = hasToolingToggle ? 'flex' : 'none';
+
+    if (!hasToolingToggle) {
+        jsonFieldViewMode = 'both';
+        selector.value = 'both';
+    }
+}
+
+async function retryInterruptedCombinedRequest() {
+    if (!interruptedCombinedRequest || currentQueryId) return;
+
+    const { path, method, body, headers } = interruptedCombinedRequest;
+    const selector = document.getElementById('jsonFieldMode');
+
+    logContent.innerHTML = '';
+    currentTable = null;
+    currentTbody = null;
+    currentResultData = null;
+
+    currentQueryId = 'query_' + Date.now();
+    queryStartTime = Date.now();
+    document.getElementById('stopQueryBtn').style.display = 'inline-block';
+    document.getElementById('convertUtcCheckbox').disabled = true;
+    document.body.style.cursor = 'wait';
+    if (selector) selector.disabled = true;
+
+    queryTimerInterval = setInterval(() => {
+        const elapsedMs = Date.now() - queryStartTime;
+        const elapsedSec = (elapsedMs / 1000).toFixed(1);
+        document.getElementById('resultsCount').textContent = `Re-fetching Data + Tooling... (${elapsedSec}s)`;
+    }, 100);
+
+    try {
+        const result = await window.api.executeREST(path, method, body, headers, currentQueryId);
+        if (result && result.aborted) {
+            handleAbortedCombinedRestResult(result, { path, method, body, headers });
+        } else {
+            interruptedCombinedRequest = null;
+            jsonFieldViewMode = 'both';
+            if (selector) selector.value = 'both';
+            renderResult(result);
+        }
+    } catch (err) {
+        const errEl = document.createElement('div');
+        errEl.className = 'log-line';
+        errEl.innerHTML = formatErrorMessage(err.message);
+        logContent.appendChild(errEl);
+    } finally {
+        if (queryTimerInterval) {
+            clearInterval(queryTimerInterval);
+            queryTimerInterval = null;
+        }
+        document.getElementById('stopQueryBtn').style.display = 'none';
+        document.getElementById('convertUtcCheckbox').disabled = false;
+        currentQueryId = null;
+        document.body.style.cursor = 'default';
+        if (selector) selector.disabled = false;
+    }
+}
+
+async function retryInterruptedSingleSourceRequest(sourceMode) {
+    if (!interruptedCombinedRequest || currentQueryId) return;
+
+    const { path, method, body, headers } = interruptedCombinedRequest;
+    const selector = document.getElementById('jsonFieldMode');
+    const previousMode = sourceMode === 'data' ? 'tooling' : 'data';
+    const existingDataPayload = currentResultData?._dataPayload || (currentResultData?._apiType === 'data' ? sanitizeForJsonOutput(currentResultData) : null);
+    const existingToolingPayload = currentResultData?._toolingPayload || (currentResultData?._apiType === 'tooling' ? sanitizeForJsonOutput(currentResultData) : null);
+
+    const restorePreviousSnap = () => {
+        const hasPreviousPayload = previousMode === 'data'
+            ? !!existingDataPayload
+            : !!existingToolingPayload;
+
+        if (!hasPreviousPayload) {
+            return false;
+        }
+
+        jsonFieldViewMode = previousMode;
+        if (selector) selector.value = previousMode;
+        renderResult(currentResultData, true);
+
+        const elapsedMs = queryStartTime ? Date.now() - queryStartTime : 0;
+        const elapsedSec = (elapsedMs / 1000).toFixed(2);
+        document.getElementById('resultsCount').textContent = `Partial result - ${previousMode} only (stopped, ${elapsedSec}s).`;
+        return true;
+    };
+
+    if (selector) selector.disabled = true;
+    document.getElementById('stopQueryBtn').style.display = 'inline-block';
+    document.getElementById('convertUtcCheckbox').disabled = true;
+    document.body.style.cursor = 'wait';
+
+    currentQueryId = 'query_' + Date.now();
+    queryStartTime = Date.now();
+
+    queryTimerInterval = setInterval(() => {
+        const elapsedMs = Date.now() - queryStartTime;
+        const elapsedSec = (elapsedMs / 1000).toFixed(1);
+        document.getElementById('resultsCount').textContent = `Fetching ${sourceMode} response... (${elapsedSec}s)`;
+    }, 100);
+
+    try {
+        const singleResult = await window.api.executeREST(path, method, body, headers, currentQueryId, sourceMode);
+
+        if (singleResult && singleResult.aborted) {
+            if (!restorePreviousSnap()) {
+                handleAbortedCombinedRestResult(singleResult, { path, method, body, headers });
+            }
+            return;
+        }
+
+        const payload = sanitizeForJsonOutput(singleResult);
+        const nextResult = {
+            ...(currentResultData && typeof currentResultData === 'object' ? currentResultData : {}),
+            _interruptedBothFetch: true,
+            _apiType: sourceMode,
+            _dataPayload: sourceMode === 'data' ? payload : existingDataPayload,
+            _toolingPayload: sourceMode === 'tooling' ? payload : existingToolingPayload
+        };
+
+        if (sourceMode === 'tooling' && !nextResult._dataPayload) {
+            delete nextResult._dataPayload;
+        }
+        if (sourceMode === 'data' && !nextResult._toolingPayload) {
+            delete nextResult._toolingPayload;
+        }
+
+        renderResult(nextResult);
+    } catch (err) {
+        const isAbortError = err && (err.name === 'AbortError' || (typeof err.message === 'string' && (err.message.includes('aborted') || err.message.includes('AbortError'))));
+        if (isAbortError && restorePreviousSnap()) {
+            return;
+        }
+
+        const errEl = document.createElement('div');
+        errEl.className = 'log-line';
+        errEl.innerHTML = formatErrorMessage(err.message);
+        logContent.appendChild(errEl);
+    } finally {
+        if (queryTimerInterval) {
+            clearInterval(queryTimerInterval);
+            queryTimerInterval = null;
+        }
+
+        document.getElementById('stopQueryBtn').style.display = 'none';
+        document.getElementById('convertUtcCheckbox').disabled = false;
+        currentQueryId = null;
+        document.body.style.cursor = 'default';
+        if (selector) selector.disabled = false;
+    }
+}
+
+function handleAbortedCombinedRestResult(result, requestContext) {
+    if (!result || !(result._apiType === 'data' || result._apiType === 'tooling')) {
+        const errEl = document.createElement('div');
+        errEl.className = 'log-line';
+        errEl.style.background = '#fff3cd';
+        errEl.style.color = '#856404';
+        errEl.innerHTML = '⏹ Query was stopped';
+        logContent.appendChild(errEl);
+        return;
+    }
+
+    const selector = document.getElementById('jsonFieldMode');
+    const sourceMode = result._apiType;
+    const payload = sanitizeForJsonOutput(result);
+
+    if (sourceMode === 'data') {
+        result._dataPayload = payload;
+    } else {
+        result._toolingPayload = payload;
+    }
+
+    result._interruptedBothFetch = true;
+    result._mergeWarning = result._mergeWarning || 'Stopped before Data + Tooling merge completed.';
+
+    interruptedCombinedRequest = {
+        path: requestContext.path,
+        method: requestContext.method,
+        body: requestContext.body,
+        headers: requestContext.headers
+    };
+
+    jsonFieldViewMode = sourceMode;
+    if (selector) selector.value = sourceMode;
+
+    renderResult(result);
+
+    const elapsedMs = queryStartTime ? Date.now() - queryStartTime : 0;
+    const elapsedSec = (elapsedMs / 1000).toFixed(2);
+    document.getElementById('resultsCount').textContent = `Partial result - ${sourceMode} only (stopped, ${elapsedSec}s).`;
+}
+
 // Recursively convert datetime values in an object or array
 function convertDatetimesInObject(obj) {
     if (obj === null || obj === undefined) return obj;
@@ -335,6 +735,228 @@ function convertDatetimesInObject(obj) {
     }
     
     return obj;
+}
+
+// Remove internal metadata keys (e.g., _apiType, _mergeWarning) from user-facing JSON output
+function sanitizeForJsonOutput(obj) {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        return obj.map(item => sanitizeForJsonOutput(item));
+    }
+
+    if (typeof obj === 'object') {
+        const sanitized = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+            if (key.startsWith('_')) continue;
+            sanitized[key] = sanitizeForJsonOutput(obj[key]);
+        }
+        return sanitized;
+    }
+
+    return obj;
+}
+
+// Add visual markers to tooling-only fields for JSON display (does not affect copied/exported JSON)
+function markToolingFieldsForDisplay(obj, toolingFieldPathSet, basePath = '') {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        return obj.map(item => markToolingFieldsForDisplay(item, toolingFieldPathSet, basePath));
+    }
+
+    if (typeof obj === 'object') {
+        const marked = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+            const path = basePath ? `${basePath}.${key}` : key;
+            const displayKey = toolingFieldPathSet.has(path) ? `⚙️ ${key}` : key;
+            marked[displayKey] = markToolingFieldsForDisplay(obj[key], toolingFieldPathSet, path);
+        }
+        return marked;
+    }
+
+    return obj;
+}
+
+function isRenderableJsonBranch(value) {
+    if (value === undefined) return false;
+    if (value === null) return true;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+}
+
+function filterJsonByToolingMode(obj, toolingFieldPathSet, includeToolingOnly, basePath = '') {
+    if (obj === null || obj === undefined) return obj;
+
+    if (Array.isArray(obj)) {
+        const filteredArray = obj
+            .map(item => filterJsonByToolingMode(item, toolingFieldPathSet, includeToolingOnly, basePath))
+            .filter(item => isRenderableJsonBranch(item));
+        return filteredArray;
+    }
+
+    if (typeof obj === 'object') {
+        const filteredObject = {};
+        for (const key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+
+            const path = basePath ? `${basePath}.${key}` : key;
+            const isToolingField = toolingFieldPathSet.has(path);
+            const child = filterJsonByToolingMode(obj[key], toolingFieldPathSet, includeToolingOnly, path);
+
+            if (!isRenderableJsonBranch(child)) continue;
+
+            if (includeToolingOnly) {
+                if (isToolingField || (typeof child === 'object' && child !== null)) {
+                    filteredObject[key] = child;
+                }
+            } else if (!isToolingField) {
+                filteredObject[key] = child;
+            }
+        }
+        return filteredObject;
+    }
+
+    const isToolingField = toolingFieldPathSet.has(basePath);
+    if (includeToolingOnly) {
+        return isToolingField ? obj : undefined;
+    }
+    return isToolingField ? undefined : obj;
+}
+
+function mergeApiResultsForDisplay(dataValue, toolingValue) {
+    if (dataValue === undefined) return toolingValue;
+    if (toolingValue === undefined) return dataValue;
+
+    if (Array.isArray(dataValue) && Array.isArray(toolingValue)) {
+        const combined = [...toolingValue, ...dataValue];
+        const seen = new Set();
+        const deduped = [];
+
+        for (const item of combined) {
+            const key = (item && typeof item === 'object') ? (item.Id || JSON.stringify(item)) : String(item);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            deduped.push(item);
+        }
+
+        return deduped;
+    }
+
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObject = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (isDataObject && isToolingObject) {
+        const merged = { ...toolingValue, ...dataValue };
+        const keys = new Set([...Object.keys(toolingValue), ...Object.keys(dataValue)]);
+        for (const key of keys) {
+            if (Object.prototype.hasOwnProperty.call(dataValue, key) && Object.prototype.hasOwnProperty.call(toolingValue, key)) {
+                merged[key] = mergeApiResultsForDisplay(dataValue[key], toolingValue[key]);
+            }
+        }
+        return merged;
+    }
+
+    return dataValue;
+}
+
+function collectToolingOnlyFieldPathsForDisplay(dataValue, toolingValue, basePath = '') {
+    const paths = [];
+    const isDataObject = dataValue && typeof dataValue === 'object' && !Array.isArray(dataValue);
+    const isToolingObject = toolingValue && typeof toolingValue === 'object' && !Array.isArray(toolingValue);
+
+    if (!isToolingObject) {
+        return paths;
+    }
+
+    if (!isDataObject) {
+        if (basePath) paths.push(basePath);
+        return paths;
+    }
+
+    for (const key of Object.keys(toolingValue)) {
+        const path = basePath ? `${basePath}.${key}` : key;
+
+        if (!Object.prototype.hasOwnProperty.call(dataValue, key)) {
+            paths.push(path);
+            continue;
+        }
+
+        const nestedPaths = collectToolingOnlyFieldPathsForDisplay(dataValue[key], toolingValue[key], path);
+        if (nestedPaths.length > 0) {
+            paths.push(...nestedPaths);
+        }
+    }
+
+    return paths;
+}
+
+function buildMergedResultFromCachedPayloads(sourceObj) {
+    const dataPayload = sourceObj?._dataPayload;
+    const toolingPayload = sourceObj?._toolingPayload;
+    if (!dataPayload || !toolingPayload) return null;
+
+    const merged = mergeApiResultsForDisplay(dataPayload, toolingPayload);
+    merged._toolingFieldPaths = collectToolingOnlyFieldPathsForDisplay(dataPayload, toolingPayload);
+    merged._dataPayload = dataPayload;
+    merged._toolingPayload = toolingPayload;
+    merged._apiType = 'both';
+    return merged;
+}
+
+function buildJsonDisplayData(sourceObj) {
+    const dataPayload = sourceObj?._dataPayload;
+    const toolingPayload = sourceObj?._toolingPayload;
+    const hasDualPayloads = !!dataPayload && !!toolingPayload;
+
+    const baseSource = (jsonFieldViewMode === 'both' && hasDualPayloads)
+        ? (buildMergedResultFromCachedPayloads(sourceObj) || sourceObj)
+        : sourceObj;
+
+    if (jsonFieldViewMode === 'data' && dataPayload && typeof dataPayload === 'object') {
+        return sanitizeForJsonOutput(dataPayload);
+    }
+
+    if (jsonFieldViewMode === 'tooling' && toolingPayload && typeof toolingPayload === 'object') {
+        return sanitizeForJsonOutput(toolingPayload);
+    }
+
+    const sanitized = sanitizeForJsonOutput(baseSource);
+    const toolingFieldPaths = Array.isArray(baseSource?._toolingFieldPaths) ? baseSource._toolingFieldPaths : [];
+    const toolingPathSet = new Set(toolingFieldPaths);
+
+    let filtered = sanitized;
+    if (toolingFieldPaths.length > 0) {
+        if (jsonFieldViewMode === 'data') {
+            filtered = filterJsonByToolingMode(sanitized, toolingPathSet, false);
+        } else if (jsonFieldViewMode === 'tooling') {
+            filtered = filterJsonByToolingMode(sanitized, toolingPathSet, true);
+        }
+    }
+
+    if (jsonFieldViewMode === 'data') {
+        return filtered;
+    }
+
+    const marked = toolingFieldPaths.length > 0
+        ? markToolingFieldsForDisplay(filtered, toolingPathSet)
+        : filtered;
+
+    if (jsonFieldViewMode === 'both' && hasDualPayloads && marked && typeof marked === 'object') {
+        const dataUrl = dataPayload?.attributes?.url;
+        const toolingUrl = toolingPayload?.attributes?.url;
+
+        if (marked.attributes && typeof marked.attributes === 'object' && (dataUrl || toolingUrl)) {
+            const dataPart = dataUrl ? `data=${dataUrl}` : 'data=n/a';
+            const toolingPart = toolingUrl ? `tooling=${toolingUrl}` : 'tooling=n/a';
+            marked.attributes.url = `[both] ${dataPart}; ${toolingPart}`;
+        }
+    }
+
+    return marked;
 }
 
 // Version checking and release notes
@@ -553,7 +1175,7 @@ function exportToJSON() {
                 if (cellValue === null || cellValue === undefined) cellValue = '';
                 if (typeof cellValue === 'object') {
                     if (cellValue.Name || cellValue.name) cellValue = cellValue.Name || cellValue.name;
-                    else cellValue = JSON.stringify(cellValue);
+                    else cellValue = JSON.stringify(sanitizeForJsonOutput(cellValue));
                 }
                 cellValue = String(cellValue).toLowerCase();
                 
@@ -569,7 +1191,11 @@ function exportToJSON() {
         }
     }
     
-    const jsonStr = JSON.stringify(dataToExport, null, 2);
+    const exportPayload = (!dataToExport.records && !Array.isArray(dataToExport))
+        ? buildJsonDisplayData(dataToExport)
+        : sanitizeForJsonOutput(dataToExport);
+
+    const jsonStr = JSON.stringify(exportPayload, null, 2);
     const blob = new Blob([jsonStr], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -604,7 +1230,7 @@ function exportToCSV() {
                 if (cellValue === null || cellValue === undefined) cellValue = '';
                 if (typeof cellValue === 'object') {
                     if (cellValue.Name || cellValue.name) cellValue = cellValue.Name || cellValue.name;
-                    else cellValue = JSON.stringify(cellValue);
+                    else cellValue = JSON.stringify(sanitizeForJsonOutput(cellValue));
                 }
                 cellValue = String(cellValue).toLowerCase();
                 
@@ -614,7 +1240,7 @@ function exportToCSV() {
     }
     
     if (records.length === 0) {
-        alert('No records to export after filtering');
+        showAlert('No records to export after filtering');
         return;
     }
     
@@ -633,7 +1259,7 @@ function exportToCSV() {
             
             // Handle nested objects (like relationships)
             if (typeof value === 'object') {
-                value = JSON.stringify(value);
+                value = JSON.stringify(sanitizeForJsonOutput(value));
             }
             
             // Convert to string and escape
@@ -706,6 +1332,8 @@ async function changeEnvironment() {
         if(success){
             // Clear autocomplete caches when switching environments
             sobjectsCache = null;
+            dataSObjectsCache = null;
+            toolingSObjectsCache = null;
             objectFieldsCache = {};
             
             logContent.innerHTML='';
@@ -727,8 +1355,8 @@ async function changeEnvironment() {
 
             // Fetch org theme and apply header color
             applyOrgTheme();
-        } else alert('Failed to switch environment');
-    } catch(err){ alert(err.message); }
+        } else showAlert('Failed to switch environment');
+    } catch(err){ showAlert(err.message); }
 }
 
 // Fetch org theme and apply header color to toolbar
@@ -1109,14 +1737,18 @@ document.getElementById('copyTableBtn').addEventListener('click',()=>{
                 btn.textContent = originalText;
             }, 2000);
         })
-        .catch(err=>alert('❌ Failed to copy results')); 
+        .catch(err=>showAlert('❌ Failed to copy results')); 
 });
 
 // Copy JSON button
 document.getElementById('copyJsonBtn').addEventListener('click',()=>{ 
     if(!currentResultData) return; 
     const btn = document.getElementById('copyJsonBtn');
-    const jsonStr = JSON.stringify(currentResultData, null, 2);
+    const copyPayload = (!currentResultData.records && !Array.isArray(currentResultData))
+        ? buildJsonDisplayData(currentResultData)
+        : sanitizeForJsonOutput(currentResultData);
+
+    const jsonStr = JSON.stringify(copyPayload, null, 2);
     navigator.clipboard.writeText(jsonStr)
         .then(() => {
             const originalText = btn.textContent;
@@ -1125,7 +1757,7 @@ document.getElementById('copyJsonBtn').addEventListener('click',()=>{
                 btn.textContent = originalText;
             }, 2000);
         })
-        .catch(err=>alert('❌ Failed to copy JSON')); 
+        .catch(err=>showAlert('❌ Failed to copy JSON')); 
 });
 
 // Ctrl+A in log - select all results content
@@ -1146,12 +1778,25 @@ log.addEventListener('click', () => log.focus());
 // Global Escape handler to close search boxes or stop query
 document.addEventListener('keydown', e => {
     if(e.key === 'Escape') {
+        const appAlertBox = document.getElementById('appAlertBox');
         const logSearch = document.getElementById('logSearch');
         const helpModal = document.getElementById('helpModal');
         const releaseNotesModal = document.getElementById('releaseNotesModal');
+
+        // Priority 0: Close custom alert if open
+        if (appAlertBox && appAlertBox.style.display === 'flex') {
+            appAlertBox.style.display = 'none';
+            if (window.__appAlertHideTimer) {
+                clearTimeout(window.__appAlertHideTimer);
+                window.__appAlertHideTimer = null;
+            }
+            if (typeof editorView !== 'undefined' && editorView && typeof editorView.focus === 'function') {
+                editorView.focus();
+            }
+        }
         
         // Priority 1: Close help modal if open
-        if(helpModal.style.display === 'flex') {
+        else if(helpModal.style.display === 'flex') {
             toggleHelp();
         }
         // Priority 2: Close release notes modal if open
@@ -1501,7 +2146,7 @@ async function handleIdClick(event, objectType, idValue) {
         objectType = await getObjectTypeFromIdValue(idValue);
         if (!objectType) {
             console.warn('Could not determine object type for ID:', idValue);
-            alert('Cannot determine object type for this ID');
+            showAlert('Cannot determine object type for this ID');
             return;
         }
         console.log('Determined object type from ID:', objectType);
@@ -1523,13 +2168,13 @@ async function handleIdClick(event, objectType, idValue) {
             }, 800);
         }).catch(err => {
             console.error('Failed to copy ID:', err);
-            alert('Failed to copy: ' + err.message);
+            showAlert('Failed to copy: ' + err.message);
         });
     } else if (event.altKey) {
         // Alt+click: Open in Salesforce
         const currentConfig = document.getElementById('envSelector').value;
         if (!currentConfig) {
-            alert('No environment selected');
+            showAlert('No environment selected');
             return;
         }
         // Try to construct Salesforce URL from current connection
@@ -1538,11 +2183,11 @@ async function handleIdClick(event, objectType, idValue) {
                 const url = `${config.instanceUrl}/${idValue}`;
                 window.api.openExternal(url);
             } else {
-                alert('Cannot determine Salesforce URL');
+                showAlert('Cannot determine Salesforce URL');
             }
         }).catch(err => {
             console.error('Error getting config:', err);
-            alert('Cannot open Salesforce URL');
+            showAlert('Cannot open Salesforce URL');
         });
     } else {
         // Plain click: Execute REST API query in this app
@@ -1555,10 +2200,20 @@ async function handleIdClick(event, objectType, idValue) {
 async function executeRestForId(objectType, idValue) {
     try {
         const path = `${objectType}/${idValue}`;
-        const res = await window.api.executeREST(path);
-        
-        // Open result in new window with current conversion state
-        await window.api.openResultWindow({ data: res, convertUtcToLocal });
+        const requestId = `popup_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        // Open result window immediately and let popup fetch progressively.
+        await window.api.openResultWindow({
+            request: {
+                path,
+                method: 'GET',
+                body: null,
+                headers: null,
+                requestId,
+                apiMode: getDefaultJsonRequestMode()
+            },
+            convertUtcToLocal
+        });
     } catch (err) {
         // Show error in new window
         await window.api.openResultWindow({
@@ -1620,7 +2275,7 @@ if(window.api?.onSOQLProgress) {
                             }, 800);
                         }).catch(err => {
                             console.error('Failed to copy column name:', err);
-                            alert('Failed to copy: ' + err.message);
+                            showAlert('Failed to copy: ' + err.message);
                         });
                     } else {
                         sortTable(idx, headers[idx], lbl);
@@ -1700,7 +2355,7 @@ if(window.api?.onSOQLProgress) {
                 if (val === null || val === undefined) td.textContent = "";
                 else if (typeof val === "object") {
                     if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
-                    else { try { td.textContent = JSON.stringify(val); } catch { td.textContent = String(val); } }
+                    else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
                 } else {
                     // Convert UTC datetime if checkbox is enabled
                     const isDateTime = isUtcDateTime(val);
@@ -1741,10 +2396,36 @@ if(window.api?.onSOQLProgress) {
     });
 }
 
+if (window.api?.onRestProgress) {
+    window.api.onRestProgress((progress) => {
+        if (!progress || !currentQueryId || progress.requestId !== currentQueryId) return;
+
+        // Ignore progress updates when the query has already been stopped/completed.
+        if (!document.getElementById('stopQueryBtn') || document.getElementById('stopQueryBtn').style.display === 'none') {
+            return;
+        }
+
+        if (progress.phase === 'partial' && progress.result) {
+            if (queryTimerInterval) {
+                clearInterval(queryTimerInterval);
+                queryTimerInterval = null;
+            }
+
+            renderResult(progress.result);
+            const elapsedMs = queryStartTime ? Date.now() - queryStartTime : 0;
+            const elapsedSec = (elapsedMs / 1000).toFixed(2);
+            const waitingFor = Array.isArray(progress.pending) && progress.pending.length > 0
+                ? progress.pending.join(' + ')
+                : 'remaining API';
+            document.getElementById('resultsCount').textContent = `Partial result - ${progress.source} only, waiting for ${waitingFor}... (${elapsedSec}s)`;
+        }
+    });
+}
+
 // Ctrl+E and F5 handler supporting multi-line SOQL separated by blank lines
 document.addEventListener("keydown",async e=>{
     if(((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='e') || e.key === 'F5'){
-        e.preventDefault(); if(!window.api){ alert("Error: API not loaded."); return; }
+        e.preventDefault(); if(!window.api){ showAlert("Error: API not loaded."); return; }
         if(!editorView) return;
 
         // Check if environment is selected
@@ -1810,6 +2491,7 @@ document.addEventListener("keydown",async e=>{
         currentTable = null;
         currentTbody = null;
         currentResultData = null;
+        interruptedCombinedRequest = null;
         filtersVisible = false; // Reset filter visibility
         document.getElementById('buttonGroup').style.display = 'none';
         currentQueryId = 'query_' + Date.now();
@@ -1844,8 +2526,18 @@ document.addEventListener("keydown",async e=>{
                     });
                     
                     // Update the targetBlock for execution
-                    const result = await window.api.executeREST(prefixedValue);
-                    renderResult(result);
+                    currentRestRequestContext = {
+                        path: prefixedValue,
+                        method: 'GET',
+                        body: null,
+                        headers: null
+                    };
+                    const result = await window.api.executeREST(prefixedValue, 'GET', null, null, currentQueryId, getDefaultJsonRequestMode());
+                    if (result && result.aborted) {
+                        handleAbortedCombinedRestResult(result, { path: prefixedValue, method: 'GET', body: null, headers: null });
+                    } else {
+                        renderResult(result);
+                    }
                 } else {
                     // Unknown ID prefix - show error
                     clearInterval(queryTimerInterval);
@@ -1864,6 +2556,7 @@ document.addEventListener("keydown",async e=>{
                 document.getElementById('stopQueryBtn').style.display = 'none';
                 document.body.style.cursor = 'default';
                 document.getElementById('convertUtcCheckbox').disabled = false;
+                currentQueryId = null;
                 return;
             }
             
@@ -2014,9 +2707,20 @@ document.addEventListener("keydown",async e=>{
                             method = 'GET';
                         }
                     }
+
+                    currentRestRequestContext = {
+                        path,
+                        method,
+                        body,
+                        headers
+                    };
                     
-                    const res = await window.api.executeREST(path, method, body, headers);
-                    renderResult(res);
+                    const res = await window.api.executeREST(path, method, body, headers, currentQueryId, getDefaultJsonRequestMode());
+                    if (res && res.aborted) {
+                        handleAbortedCombinedRestResult(res, { path, method, body, headers });
+                    } else {
+                        renderResult(res);
+                    }
                     
                 } catch(err) {
                     const errEl=document.createElement("div"); errEl.className="log-line";
@@ -2057,11 +2761,24 @@ function renderResult(result, isRerender = false) {
         originalElapsedTime = elapsedSec;
     }
     
-    // Check if this was a Tooling API call
-    const apiIndicator = result && result._apiType === 'tooling' ? ' 🔧' : '';
+    // Check which API source produced this result
+    const apiIndicator = '';
     
     // Store result data for export
     currentResultData = result;
+
+    if (!isRerender && result && (result._apiType === 'data' || result._apiType === 'tooling' || result._apiType === 'both')) {
+        jsonFieldViewMode = result._apiType;
+        const modeSelector = document.getElementById('jsonFieldMode');
+        if (modeSelector) {
+            modeSelector.value = jsonFieldViewMode;
+        }
+    }
+
+    if (result && result._apiType === 'both') {
+        interruptedCombinedRequest = null;
+    }
+    updateJsonFieldModeVisibility(result);
     
     // Show button group if we have exportable data
     const hasAnyData = (result && typeof result === 'object');
@@ -2106,9 +2823,15 @@ function renderResult(result, isRerender = false) {
     }
 
     if (!result.records && !Array.isArray(result)) {
+        // Replace previous JSON snapshot (e.g., progressive data/tooling partials).
+        logContent.innerHTML = '';
+        currentTable = null;
+        currentTbody = null;
+
         const pre = document.createElement("pre");
         // Apply datetime conversion if enabled
-        const displayData = convertUtcToLocal ? convertDatetimesInObject(result) : result;
+        const outputData = buildJsonDisplayData(result);
+        const displayData = convertUtcToLocal ? convertDatetimesInObject(outputData) : outputData;
         const jsonString = JSON.stringify(displayData, null, 2);
         const linkedJson = linkifyIdsInJson(jsonString);
         pre.innerHTML = linkedJson;
@@ -2182,7 +2905,7 @@ function renderResult(result, isRerender = false) {
                     }, 800);
                 }).catch(err => {
                     console.error('Failed to copy column name:', err);
-                    alert('Failed to copy: ' + err.message);
+                    showAlert('Failed to copy: ' + err.message);
                 });
             } else {
                 sortTable(idx, headers[idx], lbl);
@@ -2255,7 +2978,7 @@ function renderResult(result, isRerender = false) {
             if (val === null || val === undefined) td.textContent = "";
             else if (typeof val === "object") {
                 if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
-                else { try { td.textContent = JSON.stringify(val); } catch { td.textContent = String(val); } }
+                else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
             } else {
                 // Convert UTC datetime if checkbox is enabled
                 const isDateTime = isUtcDateTime(val);
@@ -2391,7 +3114,7 @@ function sortTable(columnIndex, fieldName, displayName) {
                 if (val === null || val === undefined) td.textContent = "";
                 else if (typeof val === "object") {
                     if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
-                    else { try { td.textContent = JSON.stringify(val); } catch { td.textContent = String(val); } }
+                    else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
                 } else {
                     td.textContent = String(val);
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
@@ -2448,7 +3171,7 @@ function applyFilters() {
             
             // Handle nested objects
             if (typeof cellValue === 'object' && cellValue !== null) {
-                cellValue = cellValue.Name || cellValue.name || JSON.stringify(cellValue);
+                cellValue = cellValue.Name || cellValue.name || JSON.stringify(sanitizeForJsonOutput(cellValue));
             }
             
             // Convert to string and check if it includes filter text
@@ -2479,7 +3202,7 @@ function applyFilters() {
             if (val === null || val === undefined) td.textContent = "";
             else if (typeof val === "object") {
                 if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
-                else { try { td.textContent = JSON.stringify(val); } catch { td.textContent = String(val); } }
+                else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
             } else {
                 td.textContent = String(val);
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
@@ -2547,29 +3270,59 @@ function toggleFilters() {
 
 // ===== AUTOCOMPLETE FUNCTIONS =====
 
-// Fetch and cache all SObjects
-// Fetch and cache SObjects list
+// Fetch and cache Data API SObjects
+window.fetchDataSObjects = async function() {
+    if (dataSObjectsCache) return dataSObjectsCache;
+    const result = await window.api.describeGlobal();
+    dataSObjectsCache = result.sobjects || [];
+    return dataSObjectsCache;
+}
+
+// Fetch and cache Tooling API SObjects
+window.fetchToolingSObjects = async function() {
+    if (toolingSObjectsCache) return toolingSObjectsCache;
+    toolingSObjectsCache = (await window.api.fetchToolingObjects() || []).map(obj => ({
+        ...obj,
+        isTooling: true
+    }));
+    return toolingSObjectsCache;
+}
+
+// Fetch and cache merged SObjects list (Data + optional Tooling)
 // Exposed globally for CodeMirror autocomplete
-window.fetchSObjects = async function() {
-    if (sobjectsCache) return sobjectsCache;
+window.fetchSObjects = async function(options = {}) {
+    const { includeTooling = true } = options;
     try {
-        const result = await window.api.describeGlobal();
-        const dataSObjects = result.sobjects || [];
-        
-        // Also fetch Tooling API objects and mark them
-        const toolingSObjects = (await window.api.fetchToolingObjects() || []).map(obj => ({
-            ...obj,
-            isTooling: true
-        }));
+        if (!includeTooling) {
+            return await window.fetchDataSObjects();
+        }
+
+        if (sobjectsCache) return sobjectsCache;
+
+        const dataSObjects = await window.fetchDataSObjects();
+        const toolingSObjects = await window.fetchToolingSObjects();
         
         // Merge both lists, removing duplicates by name (prefer Data API version if exists in both)
         const dataMap = new Map(dataSObjects.map(obj => [obj.name, obj]));
         const toolingMap = new Map(toolingSObjects.map(obj => [obj.name, obj]));
         
         // Combine: data objects first, then tooling-only objects
+        // Mark overlap so autocomplete can indicate objects available in both APIs
         sobjectsCache = [
-            ...dataSObjects,
-            ...toolingSObjects.filter(obj => !dataMap.has(obj.name))
+            ...dataSObjects.map(obj => ({
+                ...obj,
+                isData: true,
+                isTooling: toolingMap.has(obj.name),
+                isBoth: toolingMap.has(obj.name)
+            })),
+            ...toolingSObjects
+                .filter(obj => !dataMap.has(obj.name))
+                .map(obj => ({
+                    ...obj,
+                    isData: false,
+                    isTooling: true,
+                    isBoth: false
+                }))
         ];
         
         console.log(`Cached ${sobjectsCache.length} objects (${dataSObjects.length} Data API + ${toolingSObjects.length} Tooling API)`);
@@ -2973,6 +3726,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     
     // Load environments
     loadEnvironments();
+    refreshToolingModeLicense();
     initAutocomplete();
     
     // Check for updates (non-blocking)
