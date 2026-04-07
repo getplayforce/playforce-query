@@ -1,4 +1,10 @@
 
+## v0.3.6
+### April, 2026
+- Remove row numbers from Copy Table button
+- Alt+Shift+F Format JSON in current block
+
+
 ## v0.3.5
 ### March, 2026
 - Fixed main window layout so a full-window vertical scrollbar no longer appears

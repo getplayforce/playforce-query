@@ -171,6 +171,7 @@ tr:hover { background:#fffae6; }
         <table>
             <tr><td>Ctrl+E or F5</td><td>Execute query block</td></tr>
             <tr><td>Ctrl+F</td><td>Find in editor/results</td></tr>
+            <tr><td>Alt+Shift+F</td><td>Format JSON in current block</td></tr>
             <tr><td>Ctrl+A</td><td>Select all (in results)</td></tr>
             <tr><td>Tab / Enter</td><td>Select autocomplete item</td></tr>
             <tr><td>, (comma)</td><td>Select item + add comma</td></tr>
@@ -1751,9 +1752,22 @@ function formatErrorMessage(errorMessage) {
 // Copy button
 // Copy Table button
 document.getElementById('copyTableBtn').addEventListener('click',()=>{ 
-    if(!log.innerText) return; 
+    if(!currentTable) return; 
     const btn = document.getElementById('copyTableBtn');
-    navigator.clipboard.writeText(log.innerText)
+
+    // Build TSV from table, skipping the row number column (first column)
+    const rows = [];
+    const headerRow = currentTable.querySelector('thead tr:first-child');
+    if (headerRow) {
+        const ths = Array.from(headerRow.children).slice(1); // Skip row number th
+        rows.push(ths.map(th => th.textContent.trim()).join('\t'));
+    }
+    Array.from(currentTbody.children).forEach(tr => {
+        const tds = Array.from(tr.children).slice(1); // Skip row number td
+        rows.push(tds.map(td => td.textContent.trim()).join('\t'));
+    });
+
+    navigator.clipboard.writeText(rows.join('\n'))
         .then(() => {
             const originalText = btn.textContent;
             btn.textContent = '✓';

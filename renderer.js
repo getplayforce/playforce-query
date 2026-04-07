@@ -91,6 +91,157 @@ const restSyntaxPlugin = ViewPlugin.fromClass(class {
   decorations: v => v.decorations
 });
 
+function extractJsonObject(text, startIndex) {
+  if (startIndex < 0 || startIndex >= text.length || text[startIndex] !== "{") {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = startIndex; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\\") {
+        escapeNext = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        const jsonText = text.slice(startIndex, i + 1);
+        return {
+          jsonText,
+          nextIndex: i + 1
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function formatJsonLikeText(text) {
+  const raw = text || "";
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // Pure JSON selection/block.
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      // Fall through to REST-style parsing.
+    }
+  }
+
+  // REST style: [METHOD] Path {json} or [METHOD] Path {headers} {body}
+  let rest = trimmed;
+  let methodPrefix = "";
+  const methodMatch = rest.match(/^(GET|POST|PATCH|PUT|DELETE)\s+/i);
+  if (methodMatch) {
+    methodPrefix = methodMatch[1].toUpperCase();
+    rest = rest.slice(methodMatch[0].length).trim();
+  }
+
+  const firstBrace = rest.indexOf("{");
+  if (firstBrace === -1) return null;
+
+  const path = rest.slice(0, firstBrace).trim();
+  if (!path) return null;
+
+  const jsonSection = rest.slice(firstBrace);
+  const formattedObjects = [];
+  let cursor = 0;
+
+  while (cursor < jsonSection.length) {
+    while (cursor < jsonSection.length && /\s/.test(jsonSection[cursor])) {
+      cursor++;
+    }
+
+    if (cursor >= jsonSection.length) break;
+    if (jsonSection[cursor] !== "{") return null;
+
+    const extracted = extractJsonObject(jsonSection, cursor);
+    if (!extracted) return null;
+
+    try {
+      const parsed = JSON.parse(extracted.jsonText);
+      formattedObjects.push(JSON.stringify(parsed, null, 2));
+    } catch {
+      return null;
+    }
+
+    cursor = extracted.nextIndex;
+  }
+
+  if (formattedObjects.length === 0) return null;
+
+  const prefix = methodPrefix ? `${methodPrefix} ${path}` : path;
+  return `${prefix} ${formattedObjects.join("\n")}`;
+}
+
+function getCurrentBlockRange(doc, position) {
+  let startLine = doc.lineAt(position).number;
+  let endLine = startLine;
+
+  while (startLine > 1 && doc.line(startLine - 1).text.trim() !== "") {
+    startLine--;
+  }
+
+  while (endLine < doc.lines && doc.line(endLine + 1).text.trim() !== "") {
+    endLine++;
+  }
+
+  return {
+    from: doc.line(startLine).from,
+    to: doc.line(endLine).to
+  };
+}
+
+function formatSelection(view) {
+  const selection = view.state.selection.main;
+  const hasSelection = selection.from !== selection.to;
+  const range = hasSelection
+    ? { from: selection.from, to: selection.to }
+    : getCurrentBlockRange(view.state.doc, selection.head);
+
+  const originalText = view.state.doc.sliceString(range.from, range.to);
+  const formattedText = formatJsonLikeText(originalText);
+
+  if (!formattedText) {
+    if (typeof window.showAlert === "function") {
+      window.showAlert("No valid JSON found to format.");
+    }
+    return true;
+  }
+
+  view.dispatch({
+    changes: { from: range.from, to: range.to, insert: formattedText },
+    selection: { anchor: range.from, head: range.from + formattedText.length }
+  });
+  return true;
+}
+
 window.createCodeMirrorEditor = function(parent) {
   // SOQL autocomplete function
   const soqlAutocompletion = async (context) => {
@@ -319,6 +470,14 @@ window.createCodeMirrorEditor = function(parent) {
       }),
       syntaxHighlighting(customHighlightStyle),
       keymap.of([
+        {
+          key: "Alt-Shift-f",
+          run: formatSelection
+        },
+        {
+          key: "Mod-Shift-f",
+          run: formatSelection
+        },
         // Custom key handlers for autocomplete
         {
           key: "Tab",
