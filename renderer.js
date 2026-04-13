@@ -139,6 +139,12 @@ function extractJsonObject(text, startIndex) {
   return null;
 }
 
+function normalizeJsonKeys(text) {
+  // Add quotes around unquoted keys in JSON-like text
+  // Handles patterns like fieldName: value -> "fieldName": value
+  return text.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:/g, '$1"$2":');
+}
+
 function formatJsonLikeText(text) {
   const raw = text || "";
   const trimmed = raw.trim();
@@ -147,10 +153,48 @@ function formatJsonLikeText(text) {
   // Pure JSON selection/block.
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
-      const parsed = JSON.parse(trimmed);
+      const normalized = normalizeJsonKeys(trimmed);
+      const parsed = JSON.parse(normalized);
       return JSON.stringify(parsed, null, 2);
     } catch {
-      // Fall through to REST-style parsing.
+      // Fall through to other parsing.
+    }
+  }
+
+  // Try to extract JSON object(s) from within text (e.g., "Campaign { ... }" or "Account {"header": "val"} {"Name": "New"}")
+  const firstBrace = trimmed.indexOf("{");
+  if (firstBrace !== -1) {
+    const prefix = trimmed.slice(0, firstBrace).trim();
+    const jsonSection = trimmed.slice(firstBrace);
+    const formattedObjects = [];
+    let cursor = 0;
+
+    while (cursor < jsonSection.length) {
+      // Skip whitespace
+      while (cursor < jsonSection.length && /\s/.test(jsonSection[cursor])) {
+        cursor++;
+      }
+
+      if (cursor >= jsonSection.length) break;
+      if (jsonSection[cursor] !== "{") break;
+
+      const extracted = extractJsonObject(jsonSection, cursor);
+      if (!extracted) break;
+
+      try {
+        const normalized = normalizeJsonKeys(extracted.jsonText);
+        const parsed = JSON.parse(normalized);
+        formattedObjects.push(JSON.stringify(parsed, null, 2));
+      } catch {
+        break;
+      }
+
+      cursor = extracted.nextIndex;
+    }
+
+    if (formattedObjects.length > 0) {
+      const formatted = formattedObjects.join(" ");
+      return prefix ? `${prefix} ${formatted}` : formatted;
     }
   }
 
@@ -163,13 +207,13 @@ function formatJsonLikeText(text) {
     rest = rest.slice(methodMatch[0].length).trim();
   }
 
-  const firstBrace = rest.indexOf("{");
-  if (firstBrace === -1) return null;
+  const restFirstBrace = rest.indexOf("{");
+  if (restFirstBrace === -1) return null;
 
-  const path = rest.slice(0, firstBrace).trim();
+  const path = rest.slice(0, restFirstBrace).trim();
   if (!path) return null;
 
-  const jsonSection = rest.slice(firstBrace);
+  const jsonSection = rest.slice(restFirstBrace);
   const formattedObjects = [];
   let cursor = 0;
 
@@ -185,7 +229,8 @@ function formatJsonLikeText(text) {
     if (!extracted) return null;
 
     try {
-      const parsed = JSON.parse(extracted.jsonText);
+      const normalized = normalizeJsonKeys(extracted.jsonText);
+      const parsed = JSON.parse(normalized);
       formattedObjects.push(JSON.stringify(parsed, null, 2));
     } catch {
       return null;

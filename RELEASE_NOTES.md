@@ -1,4 +1,10 @@
 
+## v0.3.7
+### April, 2026
+- JSON Formatting extended to header blocks
+- Column sorting retains local time
+
+
 ## v0.3.6
 ### April, 2026
 - Remove row numbers from Copy Table button

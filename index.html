@@ -3154,7 +3154,9 @@ function sortTable(columnIndex, fieldName, displayName) {
                     if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
                     else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
                 } else {
-                    td.textContent = String(val);
+                    const isDateTime = isUtcDateTime(val);
+                    const displayVal = (convertUtcToLocal && isDateTime) ? convertToLocalDateTime(val) : String(val);
+                    td.textContent = displayVal;
                     // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
                     // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
                     const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
@@ -3242,7 +3244,9 @@ function applyFilters() {
                 if (val.Id && (val.Name || val.name)) td.textContent = val.Name || val.name;
                 else { try { td.textContent = JSON.stringify(sanitizeForJsonOutput(val)); } catch { td.textContent = String(val); } }
             } else {
-                td.textContent = String(val);
+                const isDateTime = isUtcDateTime(val);
+                const displayVal = (convertUtcToLocal && isDateTime) ? convertToLocalDateTime(val) : String(val);
+                td.textContent = displayVal;
                 // Make Id fields clickable (Id, AccountId, OwnerId, etc.)
                 // Check if this looks like a Salesforce ID (15 or 18 alphanumeric characters)
                 const looksLikeId = val && typeof val === 'string' && (val.length === 15 || val.length === 18) && /^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$/.test(val);
